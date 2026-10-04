@@ -4,6 +4,7 @@ members = [
     "crates/omnicast-core",
     "crates/omnicast-protocol",
     "crates/omnicast-media",
+    "crates/omnicast-render",
 ]
 default-members = ["crates/omnicast-core"]
 
