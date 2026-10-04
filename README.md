@@ -37,6 +37,8 @@ flowchart LR
 
 - Native multi-window receiver shell (`winit` ApplicationHandler)
 - Hardware-accelerated presentation via `wgpu`
+- Live telemetry HUD (FPS, bitrate, uptime) via `egui` / `egui-wgpu`
+- In-window settings panel (display, network buffer, borderless / always-on-top)
 - mDNS receiver advertisement on LAN
 - Tokio-based RTSP listener and RTP H.264 NAL parser
 - Synthetic 60 FPS frame generator for pipeline verification

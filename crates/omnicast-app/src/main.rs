@@ -2,11 +2,14 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use omnicast_core::{AppEvent, DeviceId, SessionInfo, SessionState};
+use omnicast_core::{
+    AppEvent, DeviceId, MetricsRegistry, SessionInfo, SessionState, StreamMetrics,
+};
 use omnicast_discovery::{DiscoveryConfig, DiscoveryService};
 use omnicast_media::MockFrameGenerator;
 use omnicast_protocol::{RtspServer, RtspServerConfig};
 use omnicast_render::{DeviceSurface, GpuContext};
+use omnicast_ui::{HudAction, ViewerSettings};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,8 +19,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::WindowEvent;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 #[derive(Debug, Parser)]
@@ -52,6 +56,7 @@ struct DeviceContext {
     session: SessionInfo,
     surface: DeviceSurface,
     mock: Option<MockFrameGenerator>,
+    metrics: StreamMetrics,
 }
 
 struct App {
@@ -60,6 +65,8 @@ struct App {
     device_windows: HashMap<DeviceId, WindowId>,
     pending_sessions: Vec<SessionInfo>,
     event_rx: mpsc::Receiver<AppEvent>,
+    metrics_registry: MetricsRegistry,
+    settings: ViewerSettings,
     last_fps_log: Instant,
     last_frame_tick: Instant,
     frames_drawn: u64,
@@ -73,6 +80,10 @@ impl App {
     fn bootstrap(cli: Cli) -> Result<Self> {
         let runtime = Runtime::new().context("tokio runtime")?;
         let (tx, rx) = mpsc::channel::<AppEvent>(256);
+        let metrics_registry = MetricsRegistry::new();
+
+        let mut settings = ViewerSettings::default();
+        settings.listen_port = cli.rtsp_addr.port();
 
         let discovery = if cli.no_discovery {
             None
@@ -103,7 +114,8 @@ impl App {
         let rtsp = RtspServer::new(RtspServerConfig {
             bind_addr: cli.rtsp_addr,
             rtp_port: cli.rtp_port,
-        });
+        })
+        .with_metrics(metrics_registry.clone());
         let rtsp_tx = tx.clone();
         runtime.spawn(async move {
             if let Err(err) = rtsp.run(rtsp_tx).await {
@@ -117,6 +129,8 @@ impl App {
             device_windows: HashMap::new(),
             pending_sessions: Vec::new(),
             event_rx: rx,
+            metrics_registry,
+            settings,
             last_fps_log: Instant::now(),
             last_frame_tick: Instant::now(),
             frames_drawn: 0,
@@ -142,6 +156,7 @@ impl App {
                 }
                 AppEvent::DeviceDisconnected { id, reason } => {
                     info!(%id, %reason, "device disconnected");
+                    self.metrics_registry.unregister(id);
                     if let Some(window_id) = self.device_windows.remove(&id) {
                         self.devices.remove(&window_id);
                     }
@@ -151,6 +166,7 @@ impl App {
                         if let (Some(gpu), Some(ctx)) =
                             (self.gpu.as_ref(), self.devices.get_mut(&window_id))
                         {
+                            ctx.metrics.record_network(frame.data.len() as u64, 1);
                             if let Err(err) = ctx.surface.upload_frame(gpu, &frame) {
                                 warn!(error = %err, "frame upload failed");
                             } else {
@@ -167,17 +183,26 @@ impl App {
     fn spawn_window(&mut self, event_loop: &ActiveEventLoop, session: SessionInfo) -> Result<()> {
         let gpu = self.gpu.as_ref().context("gpu not initialized")?;
         let index = self.devices.len() as i32;
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title(format!("{} — OmniCast", session.device_name))
             .with_inner_size(LogicalSize::new(420.0, 780.0))
             .with_position(LogicalPosition::new(
                 80.0 + f64::from(index) * 40.0,
                 60.0 + f64::from(index) * 40.0,
-            ));
+            ))
+            .with_decorations(!self.settings.borderless);
+
+        if self.settings.always_on_top {
+            attrs = attrs.with_window_level(winit::window::WindowLevel::AlwaysOnTop);
+        }
 
         let window = Arc::new(event_loop.create_window(attrs).context("create_window")?);
         let window_id = window.id();
-        let surface = DeviceSurface::new(gpu, window).context("DeviceSurface::new")?;
+        let surface =
+            DeviceSurface::new(gpu, window, self.settings.clone()).context("DeviceSurface::new")?;
+
+        let metrics = StreamMetrics::new();
+        self.metrics_registry.register(session.id, metrics.clone());
 
         let mock = if self.demo || session.protocol == "simulate" {
             Some(MockFrameGenerator::new(
@@ -196,6 +221,7 @@ impl App {
                 session,
                 surface,
                 mock,
+                metrics,
             },
         );
         Ok(())
@@ -231,7 +257,6 @@ impl App {
             for i in 0..self.demo_devices {
                 let mut session = SessionInfo::new(format!("Demo Phone {}", i + 1), "simulate");
                 session.state = SessionState::Active;
-                // Modest mock resolution keeps CPU fill + upload on a 60 FPS budget.
                 session.width = 480;
                 session.height = 854;
                 session.fps = 60.0;
@@ -245,7 +270,6 @@ impl App {
     }
 
     fn tick_demo_frames(&mut self) {
-        // Pace the CPU mock generator to ~60 Hz.
         if self.last_frame_tick.elapsed() < Duration::from_micros(16_666) {
             return;
         }
@@ -257,12 +281,30 @@ impl App {
         for ctx in self.devices.values_mut() {
             if let Some(mock) = ctx.mock.as_mut() {
                 let frame = mock.next_frame();
+                // Approximate network load for demo telemetry.
+                ctx.metrics
+                    .record_network((frame.width * frame.height / 8) as u64, 1);
                 if let Err(err) = ctx.surface.upload_frame(gpu, &frame) {
                     warn!(error = %err, "mock upload failed");
                     continue;
                 }
                 ctx.surface.window.request_redraw();
             }
+        }
+    }
+
+    fn apply_settings_to_all(&mut self) {
+        let settings = self.settings.clone();
+        for ctx in self.devices.values_mut() {
+            ctx.surface.overlay.settings = settings.clone();
+            ctx.surface
+                .window
+                .set_window_level(if settings.always_on_top {
+                    winit::window::WindowLevel::AlwaysOnTop
+                } else {
+                    winit::window::WindowLevel::Normal
+                });
+            let _ = ctx.surface.window.set_decorations(!settings.borderless);
         }
     }
 }
@@ -276,7 +318,6 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
-        // Allow EventLoopProxy injection later; reuse channel handling shape.
         match event {
             AppEvent::DeviceConnected(session) => {
                 if self.gpu.is_some() {
@@ -289,6 +330,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::DeviceDisconnected { id, reason } => {
                 info!(%id, %reason, "device disconnected");
+                self.metrics_registry.unregister(id);
                 if let Some(window_id) = self.device_windows.remove(&id) {
                     self.devices.remove(&window_id);
                 }
@@ -298,6 +340,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if let (Some(gpu), Some(ctx)) =
                         (self.gpu.as_ref(), self.devices.get_mut(&window_id))
                     {
+                        ctx.metrics.record_network(frame.data.len() as u64, 1);
                         if let Err(err) = ctx.surface.upload_frame(gpu, &frame) {
                             warn!(error = %err, "frame upload failed");
                         } else {
@@ -318,9 +361,17 @@ impl ApplicationHandler<AppEvent> for App {
     ) {
         self.drain_events(event_loop);
 
+        if let Some(ctx) = self.devices.get_mut(&window_id) {
+            if ctx.surface.on_window_event(&event) {
+                ctx.surface.window.request_redraw();
+                // Still handle resize/close below.
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 if let Some(ctx) = self.devices.remove(&window_id) {
+                    self.metrics_registry.unregister(ctx.session.id);
                     self.device_windows.remove(&ctx.session.id);
                     info!(device = %ctx.session.device_name, "window closed");
                 }
@@ -337,10 +388,49 @@ impl ApplicationHandler<AppEvent> for App {
                     ctx.surface.window.request_redraw();
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyS),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(ctx) = self.devices.get_mut(&window_id) {
+                    ctx.surface.overlay.hud.settings_open = true;
+                    ctx.surface.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
-                if let (Some(gpu), Some(ctx)) = (self.gpu.as_ref(), self.devices.get(&window_id)) {
-                    ctx.surface.render(gpu);
-                    self.frames_drawn += 1;
+                let Some(gpu) = self.gpu.as_ref() else {
+                    return;
+                };
+                let Some(ctx) = self.devices.get_mut(&window_id) else {
+                    return;
+                };
+                ctx.metrics.record_frame();
+                let snap = ctx.metrics.snapshot();
+                let name = ctx.session.device_name.clone();
+                let action = ctx.surface.render(gpu, &snap, &name);
+                self.frames_drawn += 1;
+
+                // Sync settings mutated inside egui back to app + other windows.
+                let new_settings = ctx.surface.overlay.settings.clone();
+                if new_settings.listen_port != self.settings.listen_port
+                    || new_settings.always_on_top != self.settings.always_on_top
+                    || new_settings.borderless != self.settings.borderless
+                    || new_settings.show_fps != self.settings.show_fps
+                    || new_settings.hud_pinned != self.settings.hud_pinned
+                {
+                    self.settings = new_settings;
+                    self.apply_settings_to_all();
+                } else {
+                    self.settings = new_settings;
+                }
+
+                if action == HudAction::OpenSettings {
+                    info!("settings panel opened");
                 }
             }
             _ => {}

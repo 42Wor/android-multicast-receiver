@@ -2,7 +2,7 @@
 
 Semantic versioning starts at **`v0.1.0-alpha`**. Milestones below track the path from a single-device GPU shell to a multi-device production receiver.
 
-## Phase 1 — Repository & architecture *(complete in v0.1.0-alpha)*
+## Phase 1 — Repository & architecture *(complete)*
 
 - [x] Cargo workspace with clear crate boundaries
 - [x] Community docs (`README`, `ROADMAP`, `CONTRIBUTING`, MIT license)
@@ -13,27 +13,26 @@ Semantic versioning starts at **`v0.1.0-alpha`**. Milestones below track the pat
 
 **Goal:** Prove the end-to-end desktop pipeline with one phone-shaped session.
 
-### Mobile 1 — Live discovery + RTSP handshake *(current)*
+### Mobile 1 — Live discovery + RTSP handshake *(complete)*
 
 - [x] mDNS advertisement so LAN phones can see **OmniCast**
-  - `_rtsp._tcp`, `_display._tcp`, `_googlecast._tcp`
-  - Cast-style TXT (`fn`, `md`, `id`, …) + explicit LAN IPv4 when available
 - [x] Live TCP/RTSP handshake listener (`omnicast-protocol`)
-  - OPTIONS / DESCRIBE / ANNOUNCE / SETUP / PLAY / TEARDOWN
-  - UDP RTP + interleaved TCP RTP logging
 - [x] Terminal logging of incoming packets and session parameters
-  - Peer IP/port, Transport, client/server RTP ports, video codec / payload type
-- [x] `winit` `ApplicationHandler` multi-window map (`WindowId` → `DeviceContext`)
-- [x] `wgpu` fullscreen texture blit (WGSL)
-- [x] Synthetic/mock 60 FPS frame path for verification
-- [ ] Real Android device completes RTSP → first **decoded** video frame (Milestone 2)
+- [x] Multi-window map + `wgpu` blit + mock 60 FPS path
+- [ ] Real Android device completes RTSP → first **decoded** video frame (next media milestone)
 
-**Exit criteria (Mobile 1):** Run without `--demo`, phone sees **OmniCast**, tap connects, terminal shows RTSP handshake + session params.
+### Stream telemetry overlay & settings *(complete)*
+
+- [x] Thread-safe `StreamMetrics` (FPS, bitrate, uptime, frames/drops) in `omnicast-core`
+- [x] `MetricsRegistry` for protocol → UI updates
+- [x] `egui` + `egui-wgpu` translucent HUD over the video surface
+- [x] Live FPS / bitrate / uptime (and packet stats) on the device window
+- [x] Settings panel: display toggles, always-on-top, aspect lock, listen port, buffer slider, borderless
+- [x] HUD pin / auto-hide (shortcut **H**; **S** opens settings)
 
 ```bash
-cargo run -p omnicast-app
-# On Android: Cast / Screen Mirroring / Smart View → select OmniCast
-# Watch terminal for RTSP request/response and RTP lines
+cargo run -p omnicast-app -- --demo
+# Hover the top of the window for the HUD, or press H to pin / S for settings
 ```
 
 ## Phase 3 — Milestone 2: Real media path — `v0.2.0`
@@ -42,7 +41,7 @@ cargo run -p omnicast-app
 - [ ] NV12 / YUV → RGB GPU conversion path hardened
 - [ ] Stable RTSP SETUP/PLAY against at least one OEM mirror stack or Cast sink profile
 - [ ] Session teardown / reconnect without leaking GPU resources
-- [ ] Basic metrics: FPS, bitrate, drop counters in UI overlay
+- [x] Basic metrics: FPS, bitrate, drop counters in UI overlay
 
 ## Phase 4 — Milestone 3: Multi-device beta — `v0.3.0`
 

@@ -16,6 +16,7 @@ omnicast-discovery = { workspace = true }
 omnicast-protocol = { workspace = true }
 omnicast-media = { workspace = true }
 omnicast-render = { workspace = true }
+omnicast-ui = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 pollster = { workspace = true }
