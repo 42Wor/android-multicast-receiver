@@ -1,0 +1,26 @@
+[package]
+name = "omnicast-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OmniCast desktop receiver binary — winit event loop and device windows"
+default-run = "omnicast"
+
+[[bin]]
+name = "omnicast"
+path = "src/main.rs"
+
+[dependencies]
+omnicast-core = { workspace = true }
+omnicast-protocol = { workspace = true }
+omnicast-media = { workspace = true }
+omnicast-render = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+pollster = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }

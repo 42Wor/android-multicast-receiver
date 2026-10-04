@@ -5,8 +5,9 @@ members = [
     "crates/omnicast-protocol",
     "crates/omnicast-media",
     "crates/omnicast-render",
+    "crates/omnicast-app",
 ]
-default-members = ["crates/omnicast-core"]
+default-members = ["crates/omnicast-app"]
 
 [workspace.package]
 version = "0.1.0-alpha"
