@@ -200,13 +200,16 @@ fn cast_properties(config: &DiscoveryConfig, device_id: &str) -> HashMap<String,
     props.insert("id".into(), device_id.to_string());
     props.insert("fn".into(), config.instance_name.clone());
     props.insert("md".into(), "Chromecast".into());
-    props.insert("ve".into(), "02".into());
-    props.insert("st".into(), "0".into());
+    // Protocol / capability flags modern senders fingerprint before casting.
+    props.insert("ve".into(), "05".into());
+    props.insert("st".into(), "0".into()); // idle
     props.insert("ca".into(), "4101".into());
     props.insert("ic".into(), "/setup/icon.png".into());
+    props.insert("rs".into(), String::new());
     props.insert("rm".into(), String::new());
     props.insert("bs".into(), "000000000000".into());
-    props.insert("rs".into(), String::new());
+    props.insert("nf".into(), "1".into());
+    props.insert("cd".into(), "00FF00FF0".into());
     props
 }
 

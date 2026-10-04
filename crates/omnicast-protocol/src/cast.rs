@@ -1,8 +1,9 @@
 //! Google Cast TLS control listener (port 8009).
 //!
-//! Completes the TLS handshake so Android probes succeed, then keeps a stub
-//! Cast V2 control channel until a full protocol implementation lands.
+//! Completes the TLS handshake, then runs a Cast V2 control loop that answers
+//! CONNECT / PING / GET_STATUS so senders like pychromecast can finish `wait()`.
 
+use crate::cast_v2::{self, handle_message, try_decode_frame};
 use omnicast_core::AppEvent;
 use rcgen::{
     CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, RsaKeySize,
@@ -17,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
 pub enum CastError {
@@ -25,6 +26,8 @@ pub enum CastError {
     Io(#[from] std::io::Error),
     #[error("tls error: {0}")]
     Tls(String),
+    #[error("cast v2 error: {0}")]
+    V2(#[from] cast_v2::CastV2Error),
 }
 
 #[derive(Clone, Debug)]
@@ -86,16 +89,27 @@ impl CastTlsServer {
                 accept = listener.accept() => {
                     let (socket, peer) = accept?;
                     let _ = socket.set_nodelay(true);
-                    info!(%peer, "Cast TLS TCP accept — handing socket to rustls (no pre-read)");
-                    let _ = events.send(AppEvent::Status(format!(
-                        "[INFO] Incoming connection from {}",
-                        peer.ip()
-                    ))).await;
+                    debug!(%peer, "Cast TLS TCP accept — handing socket to rustls (no pre-read)");
                     let acceptor = acceptor.clone();
                     let events = events.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_cast_tls(socket, peer, acceptor, events).await {
-                            warn!(%peer, error = %err, "Cast TLS session ended");
+                        match handle_cast_tls(socket, peer, acceptor, events).await {
+                            Ok(()) => {}
+                            Err(CastError::Tls(msg)) if is_probe_disconnect(&msg) => {
+                                debug!(
+                                    %peer,
+                                    "Client disconnected during TLS handshake (probe/scan)"
+                                );
+                            }
+                            Err(CastError::Io(err))
+                                if err.kind() == std::io::ErrorKind::UnexpectedEof
+                                    || err.kind() == std::io::ErrorKind::ConnectionReset =>
+                            {
+                                debug!(%peer, error = %err, "Cast session closed by peer");
+                            }
+                            Err(err) => {
+                                warn!(%peer, error = %err, "Cast TLS session ended");
+                            }
                         }
                     });
                 }
@@ -112,40 +126,117 @@ async fn handle_cast_tls(
     events: mpsc::Sender<AppEvent>,
 ) -> Result<(), CastError> {
     // CRITICAL: never read/peek the TcpStream before accept().
-    // Consuming ClientHello bytes (0x16 0x03 0x01…) causes rustls to see EOF
-    // and fail with `tlshandshake eof`.
-    let mut tls = acceptor.accept(socket).await.map_err(|e| {
-        let msg = e.to_string();
-        let _ = events.try_send(AppEvent::Status(format!(
-            "[WARN] TLS handshake failed with {}: {msg}",
-            peer.ip()
-        )));
-        CastError::Tls(msg)
-    })?;
-    info!(%peer, "Cast TLS handshake completed (Cast V2 application protocol stub)");
+    let mut tls = match acceptor.accept(socket).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            let msg = e.to_string();
+            if is_probe_disconnect(&msg) {
+                return Err(CastError::Tls(msg));
+            }
+            let _ = events.try_send(AppEvent::Status(format!(
+                "[WARN] TLS handshake failed with {}: {msg}",
+                peer.ip()
+            )));
+            return Err(CastError::Tls(msg));
+        }
+    };
+
+    info!(%peer, "Cast TLS handshake completed — starting Cast V2 message loop");
     let _ = events
         .send(AppEvent::Status(format!(
-            "[INFO] Handshake successful — ready for screen stream ({})",
+            "[INFO] Incoming connection from {}",
+            peer.ip()
+        )))
+        .await;
+    let _ = events
+        .send(AppEvent::Status(format!(
+            "[INFO] Handshake successful — Cast V2 session open ({})",
             peer.ip()
         )))
         .await;
 
-    // Keep the socket briefly so the phone sees a completed handshake.
-    let mut buf = [0u8; 1024];
-    match tokio::time::timeout(std::time::Duration::from_secs(8), tls.read(&mut buf)).await {
-        Ok(Ok(0)) => info!(%peer, "Cast peer closed after handshake"),
-        Ok(Ok(n)) => {
-            info!(%peer, bytes = n, hex = %hex_preview(&buf[..n]), "Cast post-handshake data");
-            let _ = tls.write_all(&[]).await;
+    run_cast_v2_loop(&mut tls, peer, &events).await
+}
+
+async fn run_cast_v2_loop<S>(
+    tls: &mut S,
+    peer: SocketAddr,
+    events: &mpsc::Sender<AppEvent>,
+) -> Result<(), CastError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    let mut connected = false;
+
+    loop {
+        let n = tls.read(&mut tmp).await?;
+        if n == 0 {
+            debug!(%peer, "Cast peer closed TLS stream");
+            break;
         }
-        Ok(Err(err)) => warn!(%peer, error = %err, "Cast read error"),
-        Err(_) => info!(%peer, "Cast stub idle timeout"),
+        buf.extend_from_slice(&tmp[..n]);
+
+        while let Some((msg, consumed)) = try_decode_frame(&buf)? {
+            buf.drain(..consumed);
+            let payload_type = msg
+                .payload_json()
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| "(non-json)".into());
+
+            info!(
+                %peer,
+                namespace = %msg.namespace,
+                from = %msg.source_id,
+                to = %msg.destination_id,
+                r#type = %payload_type,
+                "Cast V2 message"
+            );
+
+            if msg.namespace == cast_v2::NS_CONNECTION && payload_type == "CONNECT" && !connected
+            {
+                connected = true;
+                let _ = events
+                    .send(AppEvent::Status(format!(
+                        "[INFO] Cast CONNECT from {} ({})",
+                        msg.source_id,
+                        peer.ip()
+                    )))
+                    .await;
+            }
+
+            let replies = handle_message(&msg)?;
+            for frame in replies {
+                tls.write_all(&frame).await?;
+                tls.flush().await?;
+                debug!(%peer, bytes = frame.len(), "Cast V2 reply sent");
+            }
+
+            if msg.namespace == cast_v2::NS_RECEIVER && payload_type == "GET_STATUS" {
+                let _ = events
+                    .send(AppEvent::Status(format!(
+                        "[INFO] RECEIVER_STATUS sent to {}",
+                        peer.ip()
+                    )))
+                    .await;
+            }
+        }
     }
     Ok(())
 }
 
+fn is_probe_disconnect(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("tls handshake eof")
+        || lower.contains("unexpected eof")
+        || lower.contains("connection reset")
+        || lower.contains("forcibly closed")
+        || lower.contains("broken pipe")
+}
+
 fn build_server_config(cfg: &CastServerConfig) -> Result<ServerConfig, CastError> {
-    // rustls 0.23 requires an explicit crypto provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let lan = cfg.lan_ip.or_else(primary_ipv4);
@@ -164,7 +255,6 @@ fn build_server_config(cfg: &CastServerConfig) -> Result<ServerConfig, CastError
 
     info!(sans = ?ordered, "generating Cast TLS RSA-2048 certificate with SANs");
 
-    // RSA-2048 + SHA-256 — best compatibility with Android Cast sender stacks.
     let key_pair = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)
         .map_err(|e| CastError::Tls(e.to_string()))?;
     let mut params =
@@ -185,8 +275,6 @@ fn build_server_config(cfg: &CastServerConfig) -> Result<ServerConfig, CastError
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
-    // Explicit TLS 1.2 + 1.3 with ring cipher suites
-    // (ECDHE-RSA-AES128-GCM-SHA256, TLS_AES_128_GCM_SHA256, etc.).
     let mut config = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -196,7 +284,6 @@ fn build_server_config(cfg: &CastServerConfig) -> Result<ServerConfig, CastError
     .with_single_cert(vec![cert_der], key_der)
     .map_err(|e| CastError::Tls(e.to_string()))?;
 
-    // Cast V2 is not HTTP — do not advertise ALPN.
     config.alpn_protocols.clear();
     Ok(config)
 }
@@ -208,12 +295,4 @@ fn primary_ipv4() -> Option<Ipv4Addr> {
         IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
         _ => None,
     }
-}
-
-fn hex_preview(data: &[u8]) -> String {
-    data.iter()
-        .take(32)
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }

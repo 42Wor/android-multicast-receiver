@@ -141,7 +141,7 @@ impl RtspServer {
                 }
                 accept = listener.accept() => {
                     let (socket, peer) = accept?;
-                    info!(
+                    debug!(
                         peer_ip = %peer.ip(),
                         peer_port = peer.port(),
                         "accepted incoming TCP on RTSP port"
@@ -150,14 +150,12 @@ impl RtspServer {
                     let mut head = [0u8; 3];
                     match socket.peek(&mut head).await {
                         Ok(n) if n > 0 && head[0] == 0x16 => {
-                            warn!(
+                            // Scanners often TLS-probe every mDNS port; plain RTSP is expected here.
+                            debug!(
                                 %peer,
                                 first_bytes = format!("{:02x?}", &head[..n]),
-                                "TLS ClientHello on RTSP port 8554 — Cast should use TCP 8009; closing"
+                                "TLS ClientHello on RTSP port 8554 — closing (use Cast :8009)"
                             );
-                            let _ = events.send(AppEvent::Status(format!(
-                                "TLS probe on 8554 from {peer} (redirect expectation: use 8009)"
-                            ))).await;
                             continue;
                         }
                         Ok(n) if n > 0 => {
@@ -173,9 +171,8 @@ impl RtspServer {
 
                     let _ = events
                         .send(AppEvent::Status(format!(
-                            "RTSP TCP accept from {}:{}",
-                            peer.ip(),
-                            peer.port()
+                            "[INFO] RTSP connection from {}",
+                            peer.ip()
                         )))
                         .await;
 
