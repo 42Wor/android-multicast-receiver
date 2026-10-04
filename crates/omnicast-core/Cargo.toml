@@ -1,0 +1,12 @@
+[package]
+name = "omnicast-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Session state, device identifiers, and messaging types for OmniCast"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }

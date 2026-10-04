@@ -1,0 +1,38 @@
+﻿[workspace]
+resolver = "2"
+members = [
+    "crates/omnicast-core",
+    "crates/omnicast-protocol",
+    "crates/omnicast-media",
+]
+default-members = ["crates/omnicast-core"]
+
+[workspace.package]
+version = "0.1.0-alpha"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/omnicast-rs/omnicast-rs"
+authors = ["OmniCast Contributors"]
+rust-version = "1.75"
+
+[workspace.dependencies]
+omnicast-core = { path = "crates/omnicast-core" }
+omnicast-discovery = { path = "crates/omnicast-discovery" }
+omnicast-protocol = { path = "crates/omnicast-protocol" }
+omnicast-media = { path = "crates/omnicast-media" }
+omnicast-render = { path = "crates/omnicast-render" }
+
+anyhow = "1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+mdns-sd = "0.13"
+parking_lot = "0.12"
+pollster = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+wgpu = "24"
+winit = "0.30"
+clap = { version = "4", features = ["derive"] }

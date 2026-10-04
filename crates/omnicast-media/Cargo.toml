@@ -1,0 +1,12 @@
+[package]
+name = "omnicast-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "H.264 decode pipeline producing raw frames for OmniCast"
+
+[dependencies]
+omnicast-core = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
