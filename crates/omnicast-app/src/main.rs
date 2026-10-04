@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use omnicast_core::{AppEvent, DeviceId, SessionInfo, SessionState};
+use omnicast_discovery::{DiscoveryConfig, DiscoveryService};
 use omnicast_media::MockFrameGenerator;
 use omnicast_protocol::{RtspServer, RtspServerConfig};
 use omnicast_render::{DeviceSurface, GpuContext};
@@ -29,6 +30,14 @@ struct Cli {
     /// Number of mock devices when --demo is set
     #[arg(long, default_value_t = 1)]
     devices: usize,
+
+    /// Disable mDNS advertisement
+    #[arg(long)]
+    no_discovery: bool,
+
+    /// Friendly receiver name for mDNS
+    #[arg(long, default_value = "OmniCast Receiver")]
+    receiver_name: String,
 
     /// RTSP listen address
     #[arg(long, default_value = "0.0.0.0:8554")]
@@ -57,12 +66,31 @@ struct App {
     demo: bool,
     demo_devices: usize,
     _runtime: Runtime,
+    _discovery: Option<DiscoveryService>,
 }
 
 impl App {
     fn bootstrap(cli: Cli) -> Result<Self> {
         let runtime = Runtime::new().context("tokio runtime")?;
         let (tx, rx) = mpsc::channel::<AppEvent>(256);
+
+        let discovery = if cli.no_discovery {
+            None
+        } else {
+            match DiscoveryService::start(DiscoveryConfig {
+                instance_name: cli.receiver_name.clone(),
+                host_name: "omnicast-receiver".into(),
+                port: cli.rtsp_addr.port(),
+                advertise_display: true,
+                advertise_googlecast: true,
+            }) {
+                Ok(svc) => Some(svc),
+                Err(err) => {
+                    warn!(error = %err, "mDNS discovery failed to start; continuing");
+                    None
+                }
+            }
+        };
 
         let rtsp = RtspServer::new(RtspServerConfig {
             bind_addr: cli.rtsp_addr,
@@ -87,6 +115,7 @@ impl App {
             demo: cli.demo,
             demo_devices: cli.devices.max(1),
             _runtime: runtime,
+            _discovery: discovery,
         })
     }
 

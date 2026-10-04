@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/omnicast-core",
+    "crates/omnicast-discovery",
     "crates/omnicast-protocol",
     "crates/omnicast-media",
     "crates/omnicast-render",

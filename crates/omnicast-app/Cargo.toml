@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 omnicast-core = { workspace = true }
+omnicast-discovery = { workspace = true }
 omnicast-protocol = { workspace = true }
 omnicast-media = { workspace = true }
 omnicast-render = { workspace = true }
