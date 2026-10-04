@@ -1,8 +1,11 @@
 use crate::gpu::GpuContext;
-use omnicast_core::{FrameFormat, VideoFrame};
+use crate::overlay::OverlayHost;
+use omnicast_core::{FrameFormat, MetricsSnapshot, VideoFrame};
+use omnicast_ui::{HudAction, ViewerSettings};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::warn;
+use winit::event::WindowEvent;
 use winit::window::Window;
 
 #[derive(Debug, Error)]
@@ -25,10 +28,15 @@ pub struct DeviceSurface {
     bind_group: wgpu::BindGroup,
     tex_width: u32,
     tex_height: u32,
+    pub overlay: OverlayHost,
 }
 
 impl DeviceSurface {
-    pub fn new(gpu: &GpuContext, window: Arc<Window>) -> Result<Self, SurfaceError> {
+    pub fn new(
+        gpu: &GpuContext,
+        window: Arc<Window>,
+        settings: ViewerSettings,
+    ) -> Result<Self, SurfaceError> {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -64,6 +72,7 @@ impl DeviceSurface {
 
         let pipeline = gpu.create_blit_pipeline(format);
         let (frame_texture, frame_view, bind_group) = create_frame_resources(gpu, 64, 64);
+        let overlay = OverlayHost::new(&window, &gpu.device, format, settings);
 
         Ok(Self {
             window,
@@ -75,7 +84,12 @@ impl DeviceSurface {
             bind_group,
             tex_width: 64,
             tex_height: 64,
+            overlay,
         })
+    }
+
+    pub fn on_window_event(&mut self, event: &WindowEvent) -> bool {
+        self.overlay.on_window_event(&self.window, event)
     }
 
     pub fn resize(&mut self, gpu: &GpuContext, width: u32, height: u32) {
@@ -130,7 +144,12 @@ impl DeviceSurface {
         Ok(())
     }
 
-    pub fn render(&self, gpu: &GpuContext) {
+    pub fn render(
+        &mut self,
+        gpu: &GpuContext,
+        metrics: &MetricsSnapshot,
+        device_name: &str,
+    ) -> HudAction {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(err) => {
@@ -140,7 +159,7 @@ impl DeviceSurface {
                     Ok(frame) => frame,
                     Err(err) => {
                         warn!(error = ?err, "surface acquire failed");
-                        return;
+                        return HudAction::None;
                     }
                 }
             }
@@ -175,9 +194,26 @@ impl DeviceSurface {
             pass.draw(0..3, 0..1);
         }
 
-        gpu.queue.submit(Some(encoder.finish()));
+        let (action, egui_bufs) = self.overlay.paint(
+            &self.window,
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &view,
+            self.config.width,
+            self.config.height,
+            metrics,
+            device_name,
+        );
+
+        gpu.queue.submit(
+            egui_bufs
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
         self.window.pre_present_notify();
         frame.present();
+        action
     }
 }
 

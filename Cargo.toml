@@ -6,6 +6,7 @@ members = [
     "crates/omnicast-protocol",
     "crates/omnicast-media",
     "crates/omnicast-render",
+    "crates/omnicast-ui",
     "crates/omnicast-app",
 ]
 default-members = ["crates/omnicast-app"]
@@ -24,6 +25,7 @@ omnicast-discovery = { path = "crates/omnicast-discovery" }
 omnicast-protocol = { path = "crates/omnicast-protocol" }
 omnicast-media = { path = "crates/omnicast-media" }
 omnicast-render = { path = "crates/omnicast-render" }
+omnicast-ui = { path = "crates/omnicast-ui" }
 
 anyhow = "1"
 bytes = "1"
@@ -39,3 +41,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 wgpu = "24"
 winit = "0.30"
 clap = { version = "4", features = ["derive"] }
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
