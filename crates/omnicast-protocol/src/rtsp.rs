@@ -140,7 +140,7 @@ impl RtspServer {
                     }
                 }
                 accept = listener.accept() => {
-                    let (mut socket, peer) = accept?;
+                    let (socket, peer) = accept?;
                     info!(
                         peer_ip = %peer.ip(),
                         peer_port = peer.port(),

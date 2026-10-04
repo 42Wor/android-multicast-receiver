@@ -94,7 +94,7 @@ impl OverlayHost {
         view: &wgpu::TextureView,
         width: u32,
         height: u32,
-        mut ui: F,
+        ui: F,
     ) -> Vec<wgpu::CommandBuffer>
     where
         F: FnMut(&egui::Context),

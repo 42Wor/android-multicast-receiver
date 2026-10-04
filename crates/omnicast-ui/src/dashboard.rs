@@ -35,7 +35,6 @@ pub struct DashboardState {
     pub auto_scroll: bool,
     pub settings_open: bool,
     pub viewer: ViewerSettings,
-    /// Draft name edited inside the settings panel.
     pub settings_name: String,
 }
 
@@ -46,7 +45,7 @@ impl Default for DashboardState {
             receiver_name: "OmniCast (Laptop)".into(),
             cast_port: 8009,
             rtsp_port: 8554,
-            status_line: "Stopped — press Start Listening to advertise on the LAN".into(),
+            status_line: "Stopped — press START LISTENING to advertise on the LAN".into(),
             devices: Vec::new(),
             activity_log: VecDeque::new(),
             auto_scroll: true,
@@ -88,7 +87,6 @@ pub enum DashboardAction {
 pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> DashboardAction {
     let mut action = DashboardAction::None;
 
-    // Smooth pulse while listening.
     if state.listening {
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
@@ -104,33 +102,87 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
     let danger_dim = egui::Color32::from_rgb(120, 40, 48);
     let accent = egui::Color32::from_rgb(96, 165, 250);
 
-    egui::CentralPanel::default()
+    // Bottom live log (~40% of window height).
+    let log_h = (ctx.screen_rect().height() * 0.40).clamp(180.0, 420.0);
+    egui::TopBottomPanel::bottom("activity_log")
+        .exact_height(log_h)
         .frame(
             egui::Frame::NONE
-                .fill(bg)
-                .inner_margin(egui::Margin::symmetric(22, 18)),
+                .fill(egui::Color32::from_rgb(8, 10, 14))
+                .inner_margin(egui::Margin::symmetric(18, 12))
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    egui::Color32::from_rgb(30, 36, 48),
+                )),
         )
         .show(ctx, |ui| {
-            // ── Header ──────────────────────────────────────────────
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-
-                // Logo mark
-                let (logo_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-                ui.painter().circle_filled(
-                    logo_rect.center(),
-                    13.0,
-                    egui::Color32::from_rgb(37, 99, 235),
+                ui.label(
+                    egui::RichText::new("Live Handshake & Activity History")
+                        .color(text)
+                        .size(14.0)
+                        .strong(),
                 );
-                ui.painter().text(
-                    logo_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "O",
-                    egui::FontId::proportional(14.0),
-                    egui::Color32::WHITE,
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new("Clear Logs")
+                                .fill(egui::Color32::from_rgb(40, 44, 56))
+                                .stroke(egui::Stroke::new(1.0_f32, border)),
+                        )
+                        .clicked()
+                    {
+                        state.clear_logs();
+                    }
+                    ui.checkbox(
+                        &mut state.auto_scroll,
+                        egui::RichText::new("Auto-scroll").color(muted).size(12.5),
+                    );
+                });
+            });
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(state.auto_scroll)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.style_mut().override_font_id = Some(egui::FontId::monospace(12.5));
+                    if state.activity_log.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "Waiting for activity… Start listening to begin.",
+                            )
+                            .color(egui::Color32::from_rgb(90, 100, 115)),
+                        );
+                    } else {
+                        for line in &state.activity_log {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("[{}]", line.stamp))
+                                        .color(egui::Color32::from_rgb(90, 200, 140))
+                                        .monospace(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&line.message)
+                                        .color(egui::Color32::from_rgb(200, 210, 220))
+                                        .monospace(),
+                                );
+                            });
+                        }
+                    }
+                });
+        });
 
+    // Top header bar.
+    egui::TopBottomPanel::top("header")
+        .exact_height(56.0)
+        .frame(
+            egui::Frame::NONE
+                .fill(panel)
+                .inner_margin(egui::Margin::symmetric(18, 10))
+                .stroke(egui::Stroke::new(1.0_f32, border)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
                 ui.label(
                     egui::RichText::new("OmniCast")
                         .color(text)
@@ -138,34 +190,39 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                         .strong(),
                 );
 
-                // Status pill
                 let (pill_label, pill_fg, pill_bg) = if state.listening {
                     ("\u{25CF} Listening", emerald, emerald_dim)
                 } else {
-                    ("\u{25CB} Stopped", muted, egui::Color32::from_rgb(36, 40, 50))
+                    (
+                        "\u{25CB} Stopped",
+                        muted,
+                        egui::Color32::from_rgb(36, 40, 50),
+                    )
                 };
                 let pill_stroke = if state.listening {
                     emerald.gamma_multiply(0.55)
                 } else {
                     border
                 };
-                let pill = egui::Frame::NONE
+                egui::Frame::NONE
                     .fill(pill_bg)
                     .corner_radius(egui::CornerRadius::same(12))
                     .inner_margin(egui::Margin::symmetric(12, 5))
-                    .stroke(egui::Stroke::new(1.0_f32, pill_stroke));
-                pill.show(ui, |ui| {
-                    ui.label(egui::RichText::new(pill_label).color(pill_fg).size(13.0));
-                });
+                    .stroke(egui::Stroke::new(1.0_f32, pill_stroke))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(pill_label).color(pill_fg).size(13.0));
+                    });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let gear = ui
                         .add_sized(
-                            [40.0, 32.0],
+                            [44.0, 36.0],
                             egui::Button::new(
-                                egui::RichText::new("\u{2699}").size(18.0).color(text),
+                                egui::RichText::new("\u{2699}")
+                                    .size(20.0)
+                                    .color(text),
                             )
-                            .fill(panel)
+                            .fill(bg)
                             .stroke(egui::Stroke::new(1.0_f32, border))
                             .corner_radius(egui::CornerRadius::same(8)),
                         )
@@ -178,18 +235,25 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                     }
                 });
             });
+        });
 
-            ui.add_space(8.0);
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::NONE
+                .fill(bg)
+                .inner_margin(egui::Margin::symmetric(24, 18)),
+        )
+        .show(ctx, |ui| {
             ui.label(
                 egui::RichText::new(&state.status_line)
                     .color(muted)
                     .size(12.5),
             );
-            ui.add_space(18.0);
+            ui.add_space(20.0);
 
-            // ── Center action ───────────────────────────────────────
+            // Large centered Start / Stop.
             ui.vertical_centered(|ui| {
-                ui.add_space(12.0);
+                ui.add_space(ui.available_height() * 0.08);
                 let t = ui.input(|i| i.time);
                 let pulse = ((t * 2.8).sin() * 0.5 + 0.5) as f32;
 
@@ -206,24 +270,24 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                             as u8,
                     );
                     let btn = ui.add_sized(
-                        [280.0, 52.0],
+                        [320.0, 58.0],
                         egui::Button::new(
-                            egui::RichText::new("\u{23F9}  Stop Listening")
-                                .size(18.0)
+                            egui::RichText::new("\u{23F9}  STOP LISTENING")
+                                .size(20.0)
                                 .color(egui::Color32::WHITE)
                                 .strong(),
                         )
                         .fill(fill)
-                        .corner_radius(egui::CornerRadius::same(12))
+                        .corner_radius(egui::CornerRadius::same(14))
                         .stroke(egui::Stroke::new(1.0_f32, danger.gamma_multiply(0.7))),
                     );
                     if btn.clicked() {
                         action = DashboardAction::Stop;
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new(format!(
-                            "Cast TLS :{}  ·  RTSP :{}",
+                            "Active ports — Cast TLS :{}  ·  RTSP :{}",
                             state.cast_port, state.rtsp_port
                         ))
                         .color(muted)
@@ -231,21 +295,21 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                     );
                 } else {
                     let btn = ui.add_sized(
-                        [280.0, 52.0],
+                        [320.0, 58.0],
                         egui::Button::new(
-                            egui::RichText::new("\u{25B6}  Start Listening")
-                                .size(18.0)
+                            egui::RichText::new("\u{25B6}  START LISTENING")
+                                .size(20.0)
                                 .color(egui::Color32::WHITE)
                                 .strong(),
                         )
                         .fill(egui::Color32::from_rgb(22, 140, 90))
-                        .corner_radius(egui::CornerRadius::same(12))
+                        .corner_radius(egui::CornerRadius::same(14))
                         .stroke(egui::Stroke::new(1.0_f32, emerald.gamma_multiply(0.65))),
                     );
                     if btn.clicked() {
                         action = DashboardAction::Start;
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new("Advertise on the LAN and accept Cast / RTSP probes")
                             .color(muted)
@@ -254,9 +318,9 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                 }
             });
 
-            ui.add_space(20.0);
+            ui.add_space(24.0);
 
-            // ── Connected devices card ──────────────────────────────
+            // Connected devices card.
             let device_count = state.devices.len();
             egui::Frame::NONE
                 .fill(panel)
@@ -317,22 +381,13 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                                             );
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "{} · {} · {} · {}",
+                                                    "{} · {} · {}",
                                                     device.device_name,
-                                                    device.protocol,
-                                                    device.codec,
-                                                    device.video_status
+                                                    device.video_status,
+                                                    device.uptime_label
                                                 ))
                                                 .color(muted)
                                                 .size(12.0),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "Session {}",
-                                                    device.uptime_label
-                                                ))
-                                                .color(accent)
-                                                .size(11.5),
                                             );
                                         });
                                         ui.with_layout(
@@ -346,9 +401,7 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                                                 if ui
                                                     .add(
                                                         egui::Button::new(label)
-                                                            .fill(egui::Color32::from_rgb(
-                                                                37, 99, 235,
-                                                            ))
+                                                            .fill(accent)
                                                             .corner_radius(
                                                                 egui::CornerRadius::same(6),
                                                             ),
@@ -366,80 +419,8 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                         }
                     }
                 });
-
-            ui.add_space(14.0);
-
-            // ── Live activity console ───────────────────────────────
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Live Activity")
-                        .color(text)
-                        .size(15.0)
-                        .strong(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new("Clear Logs")
-                                .fill(egui::Color32::from_rgb(40, 44, 56))
-                                .stroke(egui::Stroke::new(1.0_f32, border)),
-                        )
-                        .clicked()
-                    {
-                        state.clear_logs();
-                    }
-                    ui.checkbox(
-                        &mut state.auto_scroll,
-                        egui::RichText::new("Auto-scroll").color(muted).size(12.5),
-                    );
-                });
-            });
-            ui.add_space(6.0);
-
-            let console_h = ui.available_height().max(140.0);
-            egui::Frame::NONE
-                .fill(egui::Color32::from_rgb(8, 10, 14))
-                .corner_radius(egui::CornerRadius::same(10))
-                .stroke(egui::Stroke::new(
-                    1.0_f32,
-                    egui::Color32::from_rgb(30, 36, 48),
-                ))
-                .inner_margin(egui::Margin::same(10))
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(console_h)
-                        .stick_to_bottom(state.auto_scroll)
-                        .show(ui, |ui| {
-                            ui.style_mut().override_font_id =
-                                Some(egui::FontId::monospace(12.5));
-                            if state.activity_log.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Waiting for activity… Start listening to begin.",
-                                    )
-                                    .color(egui::Color32::from_rgb(90, 100, 115)),
-                                );
-                            } else {
-                                for line in &state.activity_log {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!("[{}]", line.stamp))
-                                                .color(egui::Color32::from_rgb(90, 200, 140))
-                                                .monospace(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(&line.message)
-                                                .color(egui::Color32::from_rgb(200, 210, 220))
-                                                .monospace(),
-                                        );
-                                    });
-                                }
-                            }
-                        });
-                });
         });
 
-    // ── Settings modal ──────────────────────────────────────────────
     if state.settings_open {
         let mut open = true;
         egui::Window::new("Settings")
@@ -457,13 +438,12 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
             )
             .show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new("Device Identity")
+                    egui::RichText::new("Device Name")
                         .color(text)
                         .size(15.0)
                         .strong(),
                 );
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("Receiver Name").color(muted).size(12.5));
                 ui.add(
                     egui::TextEdit::singleline(&mut state.settings_name)
                         .desired_width(360.0)
@@ -472,9 +452,9 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                 ui.add_space(8.0);
                 if ui
                     .add(
-                        egui::Button::new("Save & Re-advertise")
+                        egui::Button::new("Update")
                             .fill(egui::Color32::from_rgb(37, 99, 235))
-                            .min_size(egui::vec2(160.0, 30.0)),
+                            .min_size(egui::vec2(120.0, 30.0)),
                     )
                     .clicked()
                 {
@@ -490,7 +470,7 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                 ui.add_space(10.0);
 
                 ui.label(
-                    egui::RichText::new("Viewer HUD Preferences")
+                    egui::RichText::new("Viewer Window Overlay")
                         .color(text)
                         .size(15.0)
                         .strong(),
@@ -499,15 +479,12 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
 
                 let mut changed = false;
                 changed |= ui
-                    .checkbox(
-                        &mut state.viewer.show_fps,
-                        "Show Live FPS counter in window title bar",
-                    )
+                    .checkbox(&mut state.viewer.show_fps, "Show Live FPS in heading bar")
                     .changed();
                 changed |= ui
                     .checkbox(
                         &mut state.viewer.show_uptime,
-                        "Show Session Duration / Uptime (HH:MM:SS)",
+                        "Show Running Time / Uptime",
                     )
                     .changed();
                 changed |= ui
@@ -519,7 +496,7 @@ pub fn draw_dashboard(ctx: &egui::Context, state: &mut DashboardState) -> Dashbo
                 changed |= ui
                     .checkbox(
                         &mut state.viewer.always_on_top,
-                        "Always on Top (pin cast windows above other apps)",
+                        "Keep Window Always on Top",
                     )
                     .changed();
 

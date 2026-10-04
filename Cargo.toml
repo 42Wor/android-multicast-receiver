@@ -46,5 +46,5 @@ egui-wgpu = "0.31"
 egui-winit = "0.31"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = "0.26"
-rcgen = "0.13"
+rcgen = { version = "0.13", default-features = true, features = ["aws_lc_rs"] }
 rustls-pki-types = "1"

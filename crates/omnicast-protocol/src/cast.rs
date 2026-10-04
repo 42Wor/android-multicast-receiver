@@ -5,7 +5,8 @@
 
 use omnicast_core::AppEvent;
 use rcgen::{
-    CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, RsaKeySize,
+    PKCS_RSA_SHA256,
 };
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -84,9 +85,10 @@ impl CastTlsServer {
                 }
                 accept = listener.accept() => {
                     let (socket, peer) = accept?;
-                    info!(%peer, "Cast TLS TCP accept (expect ClientHello 0x16)");
+                    let _ = socket.set_nodelay(true);
+                    info!(%peer, "Cast TLS TCP accept — handing socket to rustls (no pre-read)");
                     let _ = events.send(AppEvent::Status(format!(
-                        "Incoming probe from {} (TCP accept on Cast :8009)",
+                        "[INFO] Incoming connection from {}",
                         peer.ip()
                     ))).await;
                     let acceptor = acceptor.clone();
@@ -109,38 +111,13 @@ async fn handle_cast_tls(
     acceptor: TlsAcceptor,
     events: mpsc::Sender<AppEvent>,
 ) -> Result<(), CastError> {
-    let mut peek = [0u8; 3];
-    let n = socket.peek(&mut peek).await?;
-    if n > 0 {
-        info!(
-            %peer,
-            first_bytes = format!("{:02x?}", &peek[..n]),
-            tls = peek[0] == 0x16,
-            "Cast port probe"
-        );
-        if peek[0] == 0x16 {
-            let _ = events
-                .send(AppEvent::Status(format!(
-                    "Incoming probe from {} (TLS ClientHello received)",
-                    peer.ip()
-                )))
-                .await;
-        } else {
-            warn!(%peer, "non-TLS data on Cast port 8009 — closing");
-            let _ = events
-                .send(AppEvent::Status(format!(
-                    "Non-TLS data on Cast port from {} — closed",
-                    peer.ip()
-                )))
-                .await;
-            return Ok(());
-        }
-    }
-
+    // CRITICAL: never read/peek the TcpStream before accept().
+    // Consuming ClientHello bytes (0x16 0x03 0x01…) causes rustls to see EOF
+    // and fail with `tlshandshake eof`.
     let mut tls = acceptor.accept(socket).await.map_err(|e| {
         let msg = e.to_string();
         let _ = events.try_send(AppEvent::Status(format!(
-            "TLS handshake failed with {}: {msg}",
+            "[WARN] TLS handshake failed with {}: {msg}",
             peer.ip()
         )));
         CastError::Tls(msg)
@@ -148,14 +125,14 @@ async fn handle_cast_tls(
     info!(%peer, "Cast TLS handshake completed (Cast V2 application protocol stub)");
     let _ = events
         .send(AppEvent::Status(format!(
-            "TLS Handshake established with Android device ({})",
+            "[INFO] Handshake successful — ready for screen stream ({})",
             peer.ip()
         )))
         .await;
 
     // Keep the socket briefly so the phone sees a completed handshake.
     let mut buf = [0u8; 1024];
-    match tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut buf)).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(8), tls.read(&mut buf)).await {
         Ok(Ok(0)) => info!(%peer, "Cast peer closed after handshake"),
         Ok(Ok(n)) => {
             info!(%peer, bytes = n, hex = %hex_preview(&buf[..n]), "Cast post-handshake data");
@@ -172,50 +149,23 @@ fn build_server_config(cfg: &CastServerConfig) -> Result<ServerConfig, CastError
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let lan = cfg.lan_ip.or_else(primary_ipv4);
-    let mut sans = vec![
-        "127.0.0.1".into(),
-        "0.0.0.0".into(),
-        "localhost".into(),
-        "OmniCast".into(),
+    let mut ordered = vec![
+        "localhost".to_string(),
+        "OmniCast".to_string(),
         cfg.receiver_name.clone(),
         cfg.mdns_hostname.clone(),
+        "127.0.0.1".to_string(),
     ];
     if let Some(ip) = lan {
-        sans.push(ip.to_string());
+        ordered.push(ip.to_string());
     }
-    // Deduplicate while preserving order.
-    sans.sort();
-    sans.dedup();
-    // Keep a stable preferred order for readability in logs.
-    let mut ordered = Vec::new();
-    for preferred in [
-        "127.0.0.1",
-        "0.0.0.0",
-        "localhost",
-        "OmniCast",
-        cfg.receiver_name.as_str(),
-        cfg.mdns_hostname.as_str(),
-    ] {
-        if sans.iter().any(|s| s == preferred) && !ordered.iter().any(|s: &String| s == preferred) {
-            ordered.push(preferred.to_string());
-        }
-    }
-    if let Some(ip) = lan {
-        let s = ip.to_string();
-        if !ordered.contains(&s) {
-            ordered.push(s);
-        }
-    }
-    for s in sans {
-        if !ordered.contains(&s) {
-            ordered.push(s);
-        }
-    }
+    ordered.sort();
+    ordered.dedup();
 
-    info!(sans = ?ordered, "generating Cast TLS certificate with SANs");
+    info!(sans = ?ordered, "generating Cast TLS RSA-2048 certificate with SANs");
 
-    // ECDSA P-256 + SHA-256 — widely accepted by Android TLS stacks.
-    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+    // RSA-2048 + SHA-256 — best compatibility with Android Cast sender stacks.
+    let key_pair = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)
         .map_err(|e| CastError::Tls(e.to_string()))?;
     let mut params =
         CertificateParams::new(ordered).map_err(|e| CastError::Tls(e.to_string()))?;
@@ -235,8 +185,8 @@ fn build_server_config(cfg: &CastServerConfig) -> Result<ServerConfig, CastError
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
-    // Explicit TLS 1.2 + 1.3 with ring's default cipher suites
-    // (includes ECDHE-ECDSA-AES128-GCM-SHA256 and TLS 1.3 AES-GCM suites).
+    // Explicit TLS 1.2 + 1.3 with ring cipher suites
+    // (ECDHE-RSA-AES128-GCM-SHA256, TLS_AES_128_GCM_SHA256, etc.).
     let mut config = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -246,7 +196,7 @@ fn build_server_config(cfg: &CastServerConfig) -> Result<ServerConfig, CastError
     .with_single_cert(vec![cert_der], key_der)
     .map_err(|e| CastError::Tls(e.to_string()))?;
 
-    // Cast V2 is not HTTP — do not advertise ALPN (avoids ClientHello rejection).
+    // Cast V2 is not HTTP — do not advertise ALPN.
     config.alpn_protocols.clear();
     Ok(config)
 }

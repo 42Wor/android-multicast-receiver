@@ -59,7 +59,7 @@ struct DeviceContext {
 struct ConnectedClient {
     session: SessionInfo,
     metrics: StreamMetrics,
-    connected_at: Instant,
+    _connected_at: Instant,
 }
 
 struct App {
@@ -149,15 +149,18 @@ impl App {
                 host_name: "omnicast".into(),
                 rtsp_port: self.cli.rtsp_addr.port(),
                 cast_port: self.cli.cast_addr.port(),
-                advertise_display: true,
+                advertise_display: false,
                 advertise_googlecast: true,
                 advertise_rtsp: true,
             }) {
                 Ok(svc) => {
                     lan_ip = svc.local_ipv4;
                     info!(%name, "mDNS advertising started");
-                    self.dashboard_state
-                        .push_log(format!("mDNS broadcaster active as \"{name}\""));
+                    self.dashboard_state.push_log(format!(
+                        "[INFO] mDNS broadcaster active as \"{name}\" (_googlecast :{} / _rtsp :{})",
+                        self.cli.cast_addr.port(),
+                        self.cli.rtsp_addr.port()
+                    ));
                     self.discovery = Some(svc);
                 }
                 Err(err) => {
@@ -208,7 +211,7 @@ impl App {
             self.cli.rtsp_addr.port()
         );
         self.dashboard_state.push_log(format!(
-            "Listeners active — Cast TLS :{} · RTSP :{}",
+            "[INFO] Listening for Android Cast on ports {} & {}...",
             self.cli.cast_addr.port(),
             self.cli.rtsp_addr.port()
         ));
@@ -318,7 +321,7 @@ impl App {
                         ConnectedClient {
                             session,
                             metrics,
-                            connected_at: Instant::now(),
+                            _connected_at: Instant::now(),
                         },
                     );
                     self.refresh_dashboard_devices();
@@ -482,7 +485,7 @@ impl App {
                     ConnectedClient {
                         session,
                         metrics,
-                        connected_at: Instant::now(),
+                        _connected_at: Instant::now(),
                     },
                 );
             }

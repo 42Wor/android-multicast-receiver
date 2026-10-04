@@ -37,7 +37,9 @@ impl Default for DiscoveryConfig {
             host_name: "omnicast".to_string(),
             rtsp_port: 8554,
             cast_port: 8009,
-            advertise_display: true,
+            // Disabled by default — advertising `_display` on 8009 makes phones
+            // probe TLS against every listed service and confuse Cast discovery.
+            advertise_display: false,
             advertise_googlecast: true,
             advertise_rtsp: true,
         }
