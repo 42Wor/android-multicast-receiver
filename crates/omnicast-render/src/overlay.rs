@@ -1,4 +1,4 @@
-//! egui-wgpu overlay host for telemetry HUD and settings.
+//! egui-wgpu overlay host for telemetry HUD, dashboard, and settings.
 
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use omnicast_core::MetricsSnapshot;
@@ -34,7 +34,6 @@ impl OverlayHost {
             None,
         );
 
-        // egui-wgpu 0.31: (device, format, depth_format, msaa_samples, dithering)
         let renderer = EguiRenderer::new(device, surface_format, None, 1, false);
 
         Self {
@@ -65,10 +64,66 @@ impl OverlayHost {
     ) -> (HudAction, Vec<wgpu::CommandBuffer>) {
         let raw_input = self.state.take_egui_input(window);
         let mut action = HudAction::None;
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            action = self.hud.ui(ctx, &mut self.settings, metrics, device_name);
-        });
+        let full_output = {
+            let hud = &mut self.hud;
+            let settings = &mut self.settings;
+            self.egui_ctx.run(raw_input, |ctx| {
+                action = hud.ui(ctx, settings, metrics, device_name);
+            })
+        };
+        let cmd = self.encode_egui(
+            window,
+            device,
+            queue,
+            encoder,
+            view,
+            width,
+            height,
+            full_output,
+        );
+        (action, cmd)
+    }
 
+    /// Generic egui frame for non-HUD windows (e.g. dashboard).
+    pub fn paint_with<F>(
+        &mut self,
+        window: &Window,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        mut ui: F,
+    ) -> Vec<wgpu::CommandBuffer>
+    where
+        F: FnMut(&egui::Context),
+    {
+        let raw_input = self.state.take_egui_input(window);
+        let full_output = self.egui_ctx.run(raw_input, ui);
+        self.encode_egui(
+            window,
+            device,
+            queue,
+            encoder,
+            view,
+            width,
+            height,
+            full_output,
+        )
+    }
+
+    fn encode_egui(
+        &mut self,
+        window: &Window,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        full_output: egui::FullOutput,
+    ) -> Vec<wgpu::CommandBuffer> {
         self.state
             .handle_platform_output(window, full_output.platform_output);
 
@@ -112,6 +167,6 @@ impl OverlayHost {
             self.renderer.free_texture(id);
         }
 
-        (action, user_cmd_bufs)
+        user_cmd_bufs
     }
 }

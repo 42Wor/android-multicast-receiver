@@ -1,13 +1,13 @@
 //! Live async RTSP control server for a single-device Milestone 1 handshake.
 
 use crate::rtp::{parse_rtp_packet, H264Depacketizer};
-use omnicast_core::{AppEvent, DeviceId, MetricsRegistry, SessionInfo, SessionState};
+use omnicast_core::{AppEvent, MetricsRegistry, SessionInfo, SessionState};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
@@ -67,7 +67,11 @@ impl RtspServer {
         self
     }
 
-    pub async fn run(self, events: mpsc::Sender<AppEvent>) -> Result<(), RtspError> {
+    pub async fn run(
+        self,
+        events: mpsc::Sender<AppEvent>,
+        mut running: watch::Receiver<bool>,
+    ) -> Result<(), RtspError> {
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         let local = listener.local_addr().unwrap_or(self.config.bind_addr);
         let server_ip = primary_ipv4()
@@ -78,7 +82,7 @@ impl RtspServer {
             bind = %local,
             server_ip = %server_ip,
             rtp_port = self.config.rtp_port,
-            "RTSP handshake listener ACTIVE — waiting for phone to connect to OmniCast"
+            "RTSP plain-text listener ACTIVE on 8554 (Miracast/RTSP — not TLS)"
         );
 
         let rtp_sock = Arc::new(UdpSocket::bind(("0.0.0.0", self.config.rtp_port)).await?);
@@ -90,107 +94,166 @@ impl RtspServer {
         let rtp_events = events.clone();
         let rtp_sock_task = Arc::clone(&rtp_sock);
         let rtp_metrics = self.metrics.clone();
+        let mut rtp_running = running.clone();
         tokio::spawn(async move {
-            if let Err(err) = rtp_loop(rtp_sock_task, rtp_events, rtp_metrics).await {
-                warn!(error = %err, "RTP loop exited");
+            let mut depacketizer = H264Depacketizer::new();
+            let mut buf = vec![0u8; 2048];
+            loop {
+                if !*rtp_running.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    _ = rtp_running.changed() => {
+                        if !*rtp_running.borrow() { break; }
+                    }
+                    result = rtp_sock_task.recv_from(&mut buf) => {
+                        match result {
+                            Ok((n, from)) => {
+                                if let Err(err) = handle_rtp_datagram(
+                                    &buf[..n],
+                                    from,
+                                    &rtp_events,
+                                    &rtp_metrics,
+                                    &mut depacketizer,
+                                ).await {
+                                    warn!(error = %err, "RTP handle error");
+                                }
+                            }
+                            Err(err) => warn!(error = %err, "RTP recv error"),
+                        }
+                    }
+                }
             }
         });
 
         loop {
-            let (socket, peer) = listener.accept().await?;
-            info!(
-                peer_ip = %peer.ip(),
-                peer_port = peer.port(),
-                "accepted incoming TCP connection (RTSP handshake starting)"
-            );
-            let _ = events
-                .send(AppEvent::Status(format!(
-                    "TCP accept from {}:{}",
-                    peer.ip(),
-                    peer.port()
-                )))
-                .await;
+            if !*running.borrow() {
+                info!("RTSP listener stopping");
+                break;
+            }
 
-            let events = events.clone();
-            let metrics = self.metrics.clone();
-            let rtp_port = self.config.rtp_port;
-            let server_ip = server_ip.clone();
-            tokio::spawn(async move {
-                if let Err(err) =
-                    handle_client(socket, peer, rtp_port, server_ip, events, metrics).await
-                {
-                    warn!(%peer, error = %err, "RTSP session ended with error");
+            tokio::select! {
+                _ = running.changed() => {
+                    if !*running.borrow() {
+                        info!("RTSP listener stopping");
+                        break;
+                    }
                 }
-            });
+                accept = listener.accept() => {
+                    let (mut socket, peer) = accept?;
+                    info!(
+                        peer_ip = %peer.ip(),
+                        peer_port = peer.port(),
+                        "accepted incoming TCP on RTSP port"
+                    );
+
+                    let mut head = [0u8; 3];
+                    match socket.peek(&mut head).await {
+                        Ok(n) if n > 0 && head[0] == 0x16 => {
+                            warn!(
+                                %peer,
+                                first_bytes = format!("{:02x?}", &head[..n]),
+                                "TLS ClientHello on RTSP port 8554 — Cast should use TCP 8009; closing"
+                            );
+                            let _ = events.send(AppEvent::Status(format!(
+                                "TLS probe on 8554 from {peer} (redirect expectation: use 8009)"
+                            ))).await;
+                            continue;
+                        }
+                        Ok(n) if n > 0 => {
+                            info!(
+                                %peer,
+                                first_bytes = format!("{:02x?}", &head[..n]),
+                                ascii = ?(std::str::from_utf8(&[head[0]]).ok()),
+                                "plain-text RTSP probe"
+                            );
+                        }
+                        _ => {}
+                    }
+
+                    let _ = events
+                        .send(AppEvent::Status(format!(
+                            "RTSP TCP accept from {}:{}",
+                            peer.ip(),
+                            peer.port()
+                        )))
+                        .await;
+
+                    let events = events.clone();
+                    let metrics = self.metrics.clone();
+                    let rtp_port = self.config.rtp_port;
+                    let server_ip = server_ip.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            handle_client(socket, peer, rtp_port, server_ip, events, metrics).await
+                        {
+                            warn!(%peer, error = %err, "RTSP session ended with error");
+                        }
+                    });
+                }
+            }
         }
+        Ok(())
     }
 }
 
-async fn rtp_loop(
-    sock: Arc<UdpSocket>,
-    events: mpsc::Sender<AppEvent>,
-    metrics: MetricsRegistry,
+async fn handle_rtp_datagram(
+    data: &[u8],
+    from: SocketAddr,
+    events: &mpsc::Sender<AppEvent>,
+    metrics: &MetricsRegistry,
+    depacketizer: &mut H264Depacketizer,
 ) -> Result<(), RtspError> {
-    let mut buf = vec![0u8; 2048];
-    let mut depacketizer = H264Depacketizer::new();
-    let placeholder = DeviceId::new();
-    let mut packet_count: u64 = 0;
+    log_raw_packet("RTP/UDP", from, data);
+    metrics.record_network_active(data.len() as u64, 1);
 
-    loop {
-        let (n, from) = sock.recv_from(&mut buf).await?;
-        packet_count += 1;
-        log_raw_packet("RTP/UDP", from, &buf[..n]);
-        metrics.record_network_active(n as u64, 1);
-
-        match parse_rtp_packet(&buf[..n]) {
-            Ok(packet) => {
-                info!(
-                    from_ip = %from.ip(),
-                    from_port = from.port(),
-                    payload_type = packet.payload_type,
-                    seq = packet.sequence,
-                    timestamp = packet.timestamp,
-                    ssrc = packet.ssrc,
-                    marker = packet.marker,
-                    payload_len = packet.payload.len(),
-                    packet_count,
-                    video_codec = "H264",
-                    "RTP packet"
-                );
-                match depacketizer.push(&packet) {
-                    Ok(nals) => {
-                        for nal in nals {
-                            let nal_type = nal.data.first().map(|b| b & 0x1f).unwrap_or(0);
-                            info!(
-                                nal_type,
-                                nal_bytes = nal.data.len(),
-                                "H.264 NAL unit extracted"
-                            );
-                            let _ = events
-                                .send(AppEvent::Status(format!(
-                                    "NAL type={nal_type} {}B pt={} seq={} from={}:{}",
-                                    nal.data.len(),
-                                    packet.payload_type,
-                                    packet.sequence,
-                                    from.ip(),
-                                    from.port()
-                                )))
-                                .await;
-                            let _ = placeholder;
-                        }
-                    }
-                    Err(err) => {
-                        metrics.record_drop_active(1);
-                        warn!(error = %err, "H.264 depacketize error");
+    match parse_rtp_packet(data) {
+        Ok(packet) => {
+            info!(
+                from_ip = %from.ip(),
+                from_port = from.port(),
+                payload_type = packet.payload_type,
+                seq = packet.sequence,
+                timestamp = packet.timestamp,
+                ssrc = packet.ssrc,
+                marker = packet.marker,
+                payload_len = packet.payload.len(),
+                video_codec = "H264",
+                "RTP packet"
+            );
+            match depacketizer.push(&packet) {
+                Ok(nals) => {
+                    for nal in nals {
+                        let nal_type = nal.data.first().map(|b| b & 0x1f).unwrap_or(0);
+                        info!(
+                            nal_type,
+                            nal_bytes = nal.data.len(),
+                            "H.264 NAL unit extracted"
+                        );
+                        let _ = events
+                            .send(AppEvent::Status(format!(
+                                "NAL type={nal_type} {}B pt={} seq={} from={}:{}",
+                                nal.data.len(),
+                                packet.payload_type,
+                                packet.sequence,
+                                from.ip(),
+                                from.port()
+                            )))
+                            .await;
                     }
                 }
-            }
-            Err(err) => {
-                metrics.record_drop_active(1);
-                warn!(error = %err, from = %from, "RTP parse error");
+                Err(err) => {
+                    metrics.record_drop_active(1);
+                    warn!(error = %err, "H.264 depacketize error");
+                }
             }
         }
+        Err(err) => {
+            metrics.record_drop_active(1);
+            warn!(error = %err, from = %from, "RTP parse error");
+        }
     }
+    Ok(())
 }
 
 async fn handle_client(
@@ -214,6 +277,8 @@ async fn handle_client(
 
     let mut session = SessionInfo::new(format!("Phone {}", peer.ip()), "rtsp");
     session.state = SessionState::Connecting;
+    session.peer_ip = peer.ip().to_string();
+    session.codec = "H264".into();
     let device_id = session.id;
 
     info!(
@@ -288,6 +353,8 @@ async fn handle_client(
             if msg.method == "PLAY" && !connected_emitted {
                 session.state = SessionState::Active;
                 session.device_name = format!("Phone {}", params.peer_ip);
+                session.peer_ip = params.peer_ip.clone();
+                session.codec = params.video_codec.clone();
                 metrics.set_active(device_id);
                 let _ = events
                     .send(AppEvent::DeviceConnected(session.clone()))

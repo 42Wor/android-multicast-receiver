@@ -45,6 +45,8 @@ pub struct SessionInfo {
     pub width: u32,
     pub height: u32,
     pub fps: f32,
+    pub peer_ip: String,
+    pub codec: String,
 }
 
 impl SessionInfo {
@@ -57,6 +59,8 @@ impl SessionInfo {
             width: 1080,
             height: 1920,
             fps: 0.0,
+            peer_ip: String::new(),
+            codec: "H264".into(),
         }
     }
 }

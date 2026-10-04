@@ -1,4 +1,4 @@
-//! OmniCast desktop receiver — winit multi-window ApplicationHandler.
+//! OmniCast desktop receiver — dashboard-first ApplicationHandler.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -7,15 +7,15 @@ use omnicast_core::{
 };
 use omnicast_discovery::{DiscoveryConfig, DiscoveryService};
 use omnicast_media::MockFrameGenerator;
-use omnicast_protocol::{RtspServer, RtspServerConfig};
-use omnicast_render::{DeviceSurface, GpuContext};
-use omnicast_ui::{HudAction, ViewerSettings};
+use omnicast_protocol::{CastServerConfig, CastTlsServer, RtspServer, RtspServerConfig};
+use omnicast_render::{DeviceSurface, GpuContext, UiOnlyWindow};
+use omnicast_ui::{DashboardAction, DashboardDevice, DashboardState, HudAction, ViewerSettings};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -25,31 +25,28 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 #[derive(Debug, Parser)]
-#[command(name = "omnicast", about = "OmniCast Android casting desktop receiver")]
+#[command(
+    name = "omnicast-app",
+    about = "OmniCast Android casting desktop receiver"
+)]
 struct Cli {
-    /// Spawn mock device session(s) rendering synthetic frames at ~60 FPS
     #[arg(long)]
     demo: bool,
-
-    /// Number of mock devices when --demo is set
     #[arg(long, default_value_t = 1)]
     devices: usize,
-
-    /// Disable mDNS advertisement
     #[arg(long)]
     no_discovery: bool,
-
-    /// Friendly receiver name for mDNS (shown on phones)
-    #[arg(long, default_value = "OmniCast")]
+    #[arg(long, default_value = "OmniCast (Laptop)")]
     receiver_name: String,
-
-    /// RTSP listen address
     #[arg(long, default_value = "0.0.0.0:8554")]
     rtsp_addr: SocketAddr,
-
-    /// RTP UDP listen port
+    #[arg(long, default_value = "0.0.0.0:8009")]
+    cast_addr: SocketAddr,
     #[arg(long, default_value_t = 5004)]
     rtp_port: u16,
+    /// Start listeners immediately (default: wait for dashboard Start)
+    #[arg(long)]
+    auto_start: bool,
 }
 
 struct DeviceContext {
@@ -59,21 +56,34 @@ struct DeviceContext {
     metrics: StreamMetrics,
 }
 
+struct ConnectedClient {
+    session: SessionInfo,
+    metrics: StreamMetrics,
+    connected_at: Instant,
+}
+
 struct App {
     gpu: Option<GpuContext>,
+    dashboard: Option<UiOnlyWindow>,
+    dashboard_id: Option<WindowId>,
+    dashboard_state: DashboardState,
     devices: HashMap<WindowId, DeviceContext>,
     device_windows: HashMap<DeviceId, WindowId>,
-    pending_sessions: Vec<SessionInfo>,
+    connected: HashMap<DeviceId, ConnectedClient>,
+    pending_open: Vec<DeviceId>,
+    event_tx: mpsc::Sender<AppEvent>,
     event_rx: mpsc::Receiver<AppEvent>,
     metrics_registry: MetricsRegistry,
     settings: ViewerSettings,
-    last_fps_log: Instant,
+    runtime: Runtime,
+    discovery: Option<DiscoveryService>,
+    running_tx: watch::Sender<bool>,
+    running_rx: watch::Receiver<bool>,
+    listeners_started: bool,
+    cli: Cli,
     last_frame_tick: Instant,
+    last_fps_log: Instant,
     frames_drawn: u64,
-    demo: bool,
-    demo_devices: usize,
-    _runtime: Runtime,
-    _discovery: Option<DiscoveryService>,
 }
 
 impl App {
@@ -81,85 +91,181 @@ impl App {
         let runtime = Runtime::new().context("tokio runtime")?;
         let (tx, rx) = mpsc::channel::<AppEvent>(256);
         let metrics_registry = MetricsRegistry::new();
+        let (running_tx, running_rx) = watch::channel(false);
 
         let mut settings = ViewerSettings::default();
         settings.listen_port = cli.rtsp_addr.port();
 
-        let discovery = if cli.no_discovery {
-            None
-        } else {
+        let dashboard_state = DashboardState {
+            receiver_name: cli.receiver_name.clone(),
+            cast_port: cli.cast_addr.port(),
+            rtsp_port: cli.rtsp_addr.port(),
+            ..DashboardState::default()
+        };
+
+        let mut app = Self {
+            gpu: None,
+            dashboard: None,
+            dashboard_id: None,
+            dashboard_state,
+            devices: HashMap::new(),
+            device_windows: HashMap::new(),
+            connected: HashMap::new(),
+            pending_open: Vec::new(),
+            event_tx: tx,
+            event_rx: rx,
+            metrics_registry,
+            settings,
+            runtime,
+            discovery: None,
+            running_tx,
+            running_rx,
+            listeners_started: false,
+            cli,
+            last_frame_tick: Instant::now(),
+            last_fps_log: Instant::now(),
+            frames_drawn: 0,
+        };
+
+        if app.cli.auto_start || app.cli.demo {
+            app.start_listeners();
+        }
+
+        Ok(app)
+    }
+
+    fn start_listeners(&mut self) {
+        if self.listeners_started {
+            return;
+        }
+        let name = self.dashboard_state.receiver_name.clone();
+        if !self.cli.no_discovery {
             match DiscoveryService::start(DiscoveryConfig {
-                instance_name: cli.receiver_name.clone(),
+                instance_name: name.clone(),
                 host_name: "omnicast".into(),
-                port: cli.rtsp_addr.port(),
+                rtsp_port: self.cli.rtsp_addr.port(),
+                cast_port: self.cli.cast_addr.port(),
                 advertise_display: true,
                 advertise_googlecast: true,
                 advertise_rtsp: true,
             }) {
                 Ok(svc) => {
-                    info!(
-                        active = svc.is_active(),
-                        name = %cli.receiver_name,
-                        "mDNS advertising — look for this name on your Android cast/mirror list"
-                    );
-                    Some(svc)
+                    info!(%name, "mDNS advertising started");
+                    self.discovery = Some(svc);
                 }
-                Err(err) => {
-                    warn!(error = %err, "mDNS discovery failed to start; continuing");
-                    None
-                }
+                Err(err) => warn!(error = %err, "mDNS failed to start"),
             }
-        };
+        }
+
+        let _ = self.running_tx.send(true);
 
         let rtsp = RtspServer::new(RtspServerConfig {
-            bind_addr: cli.rtsp_addr,
-            rtp_port: cli.rtp_port,
+            bind_addr: self.cli.rtsp_addr,
+            rtp_port: self.cli.rtp_port,
         })
-        .with_metrics(metrics_registry.clone());
-        let rtsp_tx = tx.clone();
-        runtime.spawn(async move {
-            if let Err(err) = rtsp.run(rtsp_tx).await {
+        .with_metrics(self.metrics_registry.clone());
+        let rtsp_tx = self.event_tx.clone();
+        let rtsp_rx = self.running_rx.clone();
+        self.runtime.spawn(async move {
+            if let Err(err) = rtsp.run(rtsp_tx, rtsp_rx).await {
                 error!(error = %err, "RTSP server terminated");
             }
         });
 
-        Ok(Self {
-            gpu: None,
-            devices: HashMap::new(),
-            device_windows: HashMap::new(),
-            pending_sessions: Vec::new(),
-            event_rx: rx,
-            metrics_registry,
-            settings,
-            last_fps_log: Instant::now(),
-            last_frame_tick: Instant::now(),
-            frames_drawn: 0,
-            demo: cli.demo,
-            demo_devices: cli.devices.max(1),
-            _runtime: runtime,
-            _discovery: discovery,
-        })
+        let cast = CastTlsServer::new(CastServerConfig {
+            bind_addr: self.cli.cast_addr,
+        });
+        let cast_tx = self.event_tx.clone();
+        let cast_rx = self.running_rx.clone();
+        self.runtime.spawn(async move {
+            if let Err(err) = cast.run(cast_tx, cast_rx).await {
+                error!(error = %err, "Cast TLS server terminated");
+            }
+        });
+
+        self.listeners_started = true;
+        self.dashboard_state.listening = true;
+        self.dashboard_state.status_line = format!(
+            "Listening — Cast TLS :{} · RTSP :{}",
+            self.cli.cast_addr.port(),
+            self.cli.rtsp_addr.port()
+        );
+        info!("listeners started");
+    }
+
+    fn stop_listeners(&mut self) {
+        let _ = self.running_tx.send(false);
+        if let Some(disco) = self.discovery.take() {
+            disco.shutdown();
+        }
+        self.listeners_started = false;
+        self.dashboard_state.listening = false;
+        self.dashboard_state.status_line = "Stopped — press Start to advertise on the LAN".into();
+        info!("listeners stopped");
+    }
+
+    fn apply_rename(&mut self, name: String) {
+        self.dashboard_state.receiver_name = name.clone();
+        if let Some(disco) = self.discovery.as_mut() {
+            if let Err(err) = disco.set_instance_name(&name) {
+                warn!(error = %err, "failed to update mDNS name");
+            } else {
+                self.dashboard_state.status_line = format!("mDNS name updated to '{name}'");
+            }
+        }
+    }
+
+    fn refresh_dashboard_devices(&mut self) {
+        let open = &self.device_windows;
+        self.dashboard_state.devices = self
+            .connected
+            .values()
+            .map(|c| {
+                let snap = c.metrics.snapshot();
+                DashboardDevice {
+                    id: c.session.id,
+                    peer_ip: if c.session.peer_ip.is_empty() {
+                        c.session.device_name.clone()
+                    } else {
+                        c.session.peer_ip.clone()
+                    },
+                    codec: c.session.codec.clone(),
+                    protocol: c.session.protocol.clone(),
+                    uptime_label: snap.uptime_label(),
+                    feed_open: open.contains_key(&c.session.id),
+                }
+            })
+            .collect();
     }
 
     fn drain_events(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 AppEvent::DeviceConnected(session) => {
-                    info!(device = %session.device_name, id = %session.id, "device connected");
-                    if self.gpu.is_some() {
-                        if let Err(err) = self.spawn_window(event_loop, session) {
-                            error!(error = %err, "failed to spawn device window");
-                        }
-                    } else {
-                        self.pending_sessions.push(session);
+                    info!(device = %session.device_name, id = %session.id, ip = %session.peer_ip, "device connected");
+                    let metrics = StreamMetrics::new();
+                    self.metrics_registry.register(session.id, metrics.clone());
+                    self.connected.insert(
+                        session.id,
+                        ConnectedClient {
+                            session,
+                            metrics,
+                            connected_at: Instant::now(),
+                        },
+                    );
+                    self.refresh_dashboard_devices();
+                    if let Some(dash) = &self.dashboard {
+                        dash.window.request_redraw();
                     }
                 }
                 AppEvent::DeviceDisconnected { id, reason } => {
                     info!(%id, %reason, "device disconnected");
                     self.metrics_registry.unregister(id);
+                    self.connected.remove(&id);
                     if let Some(window_id) = self.device_windows.remove(&id) {
                         self.devices.remove(&window_id);
                     }
+                    self.refresh_dashboard_devices();
                 }
                 AppEvent::FrameReady(frame) => {
                     if let Some(window_id) = self.device_windows.get(&frame.device_id).copied() {
@@ -175,36 +281,57 @@ impl App {
                         }
                     }
                 }
-                AppEvent::Status(msg) => info!(%msg, "status"),
+                AppEvent::Status(msg) => {
+                    info!(%msg, "status");
+                    self.dashboard_state.status_line = msg;
+                }
+            }
+        }
+
+        let pending: Vec<_> = self.pending_open.drain(..).collect();
+        for id in pending {
+            if let Err(err) = self.open_feed(event_loop, id) {
+                error!(error = %err, "failed to open feed");
             }
         }
     }
 
-    fn spawn_window(&mut self, event_loop: &ActiveEventLoop, session: SessionInfo) -> Result<()> {
+    fn open_feed(&mut self, event_loop: &ActiveEventLoop, id: DeviceId) -> Result<()> {
+        if let Some(window_id) = self.device_windows.get(&id).copied() {
+            if let Some(ctx) = self.devices.get(&window_id) {
+                ctx.surface.window.focus_window();
+            }
+            return Ok(());
+        }
+        let client = self.connected.get(&id).context("device not connected")?;
+        let session = client.session.clone();
+        let metrics = client.metrics.clone();
+        self.spawn_feed_window(event_loop, session, metrics)?;
+        self.refresh_dashboard_devices();
+        Ok(())
+    }
+
+    fn spawn_feed_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        session: SessionInfo,
+        metrics: StreamMetrics,
+    ) -> Result<()> {
         let gpu = self.gpu.as_ref().context("gpu not initialized")?;
         let index = self.devices.len() as i32;
-        let mut attrs = Window::default_attributes()
+        let attrs = Window::default_attributes()
             .with_title(format!("{} — OmniCast", session.device_name))
             .with_inner_size(LogicalSize::new(420.0, 780.0))
             .with_position(LogicalPosition::new(
+                120.0 + f64::from(index) * 40.0,
                 80.0 + f64::from(index) * 40.0,
-                60.0 + f64::from(index) * 40.0,
-            ))
-            .with_decorations(!self.settings.borderless);
-
-        if self.settings.always_on_top {
-            attrs = attrs.with_window_level(winit::window::WindowLevel::AlwaysOnTop);
-        }
-
+            ));
         let window = Arc::new(event_loop.create_window(attrs).context("create_window")?);
         let window_id = window.id();
         let surface =
-            DeviceSurface::new(gpu, window, self.settings.clone()).context("DeviceSurface::new")?;
+            DeviceSurface::new(gpu, window, self.settings.clone()).context("DeviceSurface")?;
 
-        let metrics = StreamMetrics::new();
-        self.metrics_registry.register(session.id, metrics.clone());
-
-        let mock = if self.demo || session.protocol == "simulate" {
+        let mock = if self.cli.demo || session.protocol == "simulate" {
             Some(MockFrameGenerator::new(
                 session.id,
                 session.width.max(320),
@@ -227,8 +354,8 @@ impl App {
         Ok(())
     }
 
-    fn ensure_gpu(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-        if self.gpu.is_some() {
+    fn ensure_dashboard(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        if self.dashboard.is_some() {
             return Ok(());
         }
 
@@ -242,31 +369,66 @@ impl App {
                 )
                 .context("bootstrap window")?,
         );
-
         let gpu =
             pollster::block_on(GpuContext::new(Some(&bootstrap))).context("GpuContext::new")?;
         self.gpu = Some(gpu);
         drop(bootstrap);
 
-        let pending: Vec<_> = self.pending_sessions.drain(..).collect();
-        for session in pending {
-            self.spawn_window(event_loop, session)?;
-        }
+        let attrs = Window::default_attributes()
+            .with_title("OmniCast Receiver")
+            .with_inner_size(LogicalSize::new(520.0, 560.0))
+            .with_position(LogicalPosition::new(64.0, 48.0));
+        let window = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .context("dashboard window")?,
+        );
+        let window_id = window.id();
+        let gpu = self.gpu.as_ref().unwrap();
+        let dash = UiOnlyWindow::new(gpu, window).context("UiOnlyWindow")?;
+        self.dashboard_id = Some(window_id);
+        self.dashboard = Some(dash);
 
-        if self.demo {
-            for i in 0..self.demo_devices {
+        if self.cli.demo {
+            for i in 0..self.cli.devices.max(1) {
                 let mut session = SessionInfo::new(format!("Demo Phone {}", i + 1), "simulate");
                 session.state = SessionState::Active;
+                session.peer_ip = format!("192.168.100.{}", 10 + i);
+                session.codec = "H264".into();
                 session.width = 480;
                 session.height = 854;
-                session.fps = 60.0;
-                self.spawn_window(event_loop, session)?;
+                let metrics = StreamMetrics::new();
+                self.metrics_registry.register(session.id, metrics.clone());
+                let id = session.id;
+                self.connected.insert(
+                    id,
+                    ConnectedClient {
+                        session,
+                        metrics,
+                        connected_at: Instant::now(),
+                    },
+                );
             }
-            info!(count = self.demo_devices, "demo sessions spawned");
+            self.refresh_dashboard_devices();
+            info!("demo clients listed on dashboard (open feed from UI)");
         }
 
-        info!("GPU initialized; receiver ready");
+        info!("dashboard window ready");
         Ok(())
+    }
+
+    fn handle_dashboard_action(&mut self, event_loop: &ActiveEventLoop, action: DashboardAction) {
+        match action {
+            DashboardAction::None => {}
+            DashboardAction::Start => self.start_listeners(),
+            DashboardAction::Stop => self.stop_listeners(),
+            DashboardAction::Rename(name) => self.apply_rename(name),
+            DashboardAction::OpenDevice(id) => {
+                if let Err(err) = self.open_feed(event_loop, id) {
+                    error!(error = %err, "open feed failed");
+                }
+            }
+        }
     }
 
     fn tick_demo_frames(&mut self) {
@@ -274,83 +436,33 @@ impl App {
             return;
         }
         self.last_frame_tick = Instant::now();
-
         let Some(gpu) = self.gpu.as_ref() else {
             return;
         };
         for ctx in self.devices.values_mut() {
             if let Some(mock) = ctx.mock.as_mut() {
                 let frame = mock.next_frame();
-                // Approximate network load for demo telemetry.
                 ctx.metrics
                     .record_network((frame.width * frame.height / 8) as u64, 1);
-                if let Err(err) = ctx.surface.upload_frame(gpu, &frame) {
-                    warn!(error = %err, "mock upload failed");
-                    continue;
+                if ctx.surface.upload_frame(gpu, &frame).is_ok() {
+                    ctx.surface.window.request_redraw();
                 }
-                ctx.surface.window.request_redraw();
             }
-        }
-    }
-
-    fn apply_settings_to_all(&mut self) {
-        let settings = self.settings.clone();
-        for ctx in self.devices.values_mut() {
-            ctx.surface.overlay.settings = settings.clone();
-            ctx.surface
-                .window
-                .set_window_level(if settings.always_on_top {
-                    winit::window::WindowLevel::AlwaysOnTop
-                } else {
-                    winit::window::WindowLevel::Normal
-                });
-            let _ = ctx.surface.window.set_decorations(!settings.borderless);
         }
     }
 }
 
 impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if let Err(err) = self.ensure_gpu(event_loop) {
-            error!(error = %err, "failed to initialize GPU");
+        if let Err(err) = self.ensure_dashboard(event_loop) {
+            error!(error = %err, "failed to open dashboard");
             event_loop.exit();
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
-        match event {
-            AppEvent::DeviceConnected(session) => {
-                if self.gpu.is_some() {
-                    if let Err(err) = self.spawn_window(event_loop, session) {
-                        error!(error = %err, "spawn from user_event failed");
-                    }
-                } else {
-                    self.pending_sessions.push(session);
-                }
-            }
-            AppEvent::DeviceDisconnected { id, reason } => {
-                info!(%id, %reason, "device disconnected");
-                self.metrics_registry.unregister(id);
-                if let Some(window_id) = self.device_windows.remove(&id) {
-                    self.devices.remove(&window_id);
-                }
-            }
-            AppEvent::FrameReady(frame) => {
-                if let Some(window_id) = self.device_windows.get(&frame.device_id).copied() {
-                    if let (Some(gpu), Some(ctx)) =
-                        (self.gpu.as_ref(), self.devices.get_mut(&window_id))
-                    {
-                        ctx.metrics.record_network(frame.data.len() as u64, 1);
-                        if let Err(err) = ctx.surface.upload_frame(gpu, &frame) {
-                            warn!(error = %err, "frame upload failed");
-                        } else {
-                            ctx.surface.window.request_redraw();
-                        }
-                    }
-                }
-            }
-            AppEvent::Status(msg) => info!(%msg, "status"),
-        }
+        let _ = self.event_tx.try_send(event);
+        self.drain_events(event_loop);
     }
 
     fn window_event(
@@ -361,27 +473,41 @@ impl ApplicationHandler<AppEvent> for App {
     ) {
         self.drain_events(event_loop);
 
-        if let Some(ctx) = self.devices.get_mut(&window_id) {
+        let is_dashboard = self.dashboard_id == Some(window_id);
+
+        if is_dashboard {
+            if let Some(dash) = self.dashboard.as_mut() {
+                if dash.on_window_event(&event) {
+                    dash.window.request_redraw();
+                }
+            }
+        } else if let Some(ctx) = self.devices.get_mut(&window_id) {
             if ctx.surface.on_window_event(&event) {
                 ctx.surface.window.request_redraw();
-                // Still handle resize/close below.
             }
         }
 
         match event {
             WindowEvent::CloseRequested => {
-                if let Some(ctx) = self.devices.remove(&window_id) {
-                    self.metrics_registry.unregister(ctx.session.id);
-                    self.device_windows.remove(&ctx.session.id);
-                    info!(device = %ctx.session.device_name, "window closed");
-                }
-                if self.devices.is_empty() {
-                    info!("no device windows remain; exiting");
+                if is_dashboard {
+                    info!("dashboard closed — shutting down");
+                    self.stop_listeners();
                     event_loop.exit();
+                    return;
+                }
+                if let Some(ctx) = self.devices.remove(&window_id) {
+                    self.device_windows.remove(&ctx.session.id);
+                    info!(device = %ctx.session.device_name, "feed window closed");
+                    self.refresh_dashboard_devices();
                 }
             }
             WindowEvent::Resized(size) => {
-                if let (Some(gpu), Some(ctx)) =
+                if is_dashboard {
+                    if let (Some(gpu), Some(dash)) = (self.gpu.as_ref(), self.dashboard.as_mut()) {
+                        dash.resize(gpu, size.width, size.height);
+                        dash.window.request_redraw();
+                    }
+                } else if let (Some(gpu), Some(ctx)) =
                     (self.gpu.as_ref(), self.devices.get_mut(&window_id))
                 {
                     ctx.surface.resize(gpu, size.width, size.height);
@@ -396,13 +522,29 @@ impl ApplicationHandler<AppEvent> for App {
                         ..
                     },
                 ..
-            } => {
+            } if !is_dashboard => {
                 if let Some(ctx) = self.devices.get_mut(&window_id) {
                     ctx.surface.overlay.hud.settings_open = true;
                     ctx.surface.window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
+                if is_dashboard {
+                    self.refresh_dashboard_devices();
+                    let action = {
+                        let gpu = self.gpu.as_ref();
+                        let dash = self.dashboard.as_mut();
+                        match (gpu, dash) {
+                            (Some(gpu), Some(dash)) => {
+                                dash.render_dashboard(gpu, &mut self.dashboard_state)
+                            }
+                            _ => DashboardAction::None,
+                        }
+                    };
+                    self.handle_dashboard_action(event_loop, action);
+                    return;
+                }
+
                 let Some(gpu) = self.gpu.as_ref() else {
                     return;
                 };
@@ -414,21 +556,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let name = ctx.session.device_name.clone();
                 let action = ctx.surface.render(gpu, &snap, &name);
                 self.frames_drawn += 1;
-
-                // Sync settings mutated inside egui back to app + other windows.
-                let new_settings = ctx.surface.overlay.settings.clone();
-                if new_settings.listen_port != self.settings.listen_port
-                    || new_settings.always_on_top != self.settings.always_on_top
-                    || new_settings.borderless != self.settings.borderless
-                    || new_settings.show_fps != self.settings.show_fps
-                    || new_settings.hud_pinned != self.settings.hud_pinned
-                {
-                    self.settings = new_settings;
-                    self.apply_settings_to_all();
-                } else {
-                    self.settings = new_settings;
-                }
-
+                self.settings = ctx.surface.overlay.settings.clone();
                 if action == HudAction::OpenSettings {
                     info!("settings panel opened");
                 }
@@ -440,7 +568,9 @@ impl ApplicationHandler<AppEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_events(event_loop);
         self.tick_demo_frames();
-
+        if let Some(dash) = &self.dashboard {
+            dash.window.request_redraw();
+        }
         if self.last_fps_log.elapsed() >= Duration::from_secs(1) {
             let fps = self.frames_drawn;
             self.frames_drawn = 0;
@@ -449,12 +579,9 @@ impl ApplicationHandler<AppEvent> for App {
                 info!(fps, windows = self.devices.len(), "present stats");
             }
         }
-
-        if !self.devices.is_empty() {
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_micros(16_666),
-            ));
-        }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(33),
+        ));
     }
 }
 
@@ -468,7 +595,7 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    info!(demo = cli.demo, devices = cli.devices, "starting OmniCast");
+    info!(demo = cli.demo, "starting OmniCast dashboard");
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let mut app = App::bootstrap(cli)?;
