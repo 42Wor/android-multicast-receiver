@@ -50,19 +50,28 @@ impl ViewerSettings {
 
         ui.collapsing("Display", |ui| {
             changed |= ui
-                .checkbox(&mut self.show_fps, "Show FPS counter")
+                .checkbox(
+                    &mut self.show_fps,
+                    "Show Live FPS counter in window title bar",
+                )
                 .changed();
             changed |= ui
-                .checkbox(&mut self.show_bitrate, "Show bitrate")
+                .checkbox(
+                    &mut self.show_uptime,
+                    "Show Session Duration / Uptime (HH:MM:SS)",
+                )
                 .changed();
             changed |= ui
-                .checkbox(&mut self.show_uptime, "Show session uptime")
+                .checkbox(&mut self.show_bitrate, "Show Network Throughput (Mbps)")
                 .changed();
             changed |= ui
                 .checkbox(&mut self.show_packet_stats, "Show frame / drop counters")
                 .changed();
             changed |= ui
-                .checkbox(&mut self.always_on_top, "Always on top")
+                .checkbox(
+                    &mut self.always_on_top,
+                    "Always on Top (pin cast windows above other apps)",
+                )
                 .changed();
             changed |= ui
                 .checkbox(&mut self.lock_aspect_ratio, "Lock aspect ratio")

@@ -96,12 +96,15 @@ impl App {
         let mut settings = ViewerSettings::default();
         settings.listen_port = cli.rtsp_addr.port();
 
-        let dashboard_state = DashboardState {
+        let mut dashboard_state = DashboardState {
             receiver_name: cli.receiver_name.clone(),
+            settings_name: cli.receiver_name.clone(),
             cast_port: cli.cast_addr.port(),
             rtsp_port: cli.rtsp_addr.port(),
+            viewer: settings.clone(),
             ..DashboardState::default()
         };
+        dashboard_state.push_log("Dashboard ready — press Start Listening to advertise");
 
         let mut app = Self {
             gpu: None,
@@ -139,6 +142,7 @@ impl App {
             return;
         }
         let name = self.dashboard_state.receiver_name.clone();
+        let mut lan_ip = None;
         if !self.cli.no_discovery {
             match DiscoveryService::start(DiscoveryConfig {
                 instance_name: name.clone(),
@@ -150,11 +154,21 @@ impl App {
                 advertise_rtsp: true,
             }) {
                 Ok(svc) => {
+                    lan_ip = svc.local_ipv4;
                     info!(%name, "mDNS advertising started");
+                    self.dashboard_state
+                        .push_log(format!("mDNS broadcaster active as \"{name}\""));
                     self.discovery = Some(svc);
                 }
-                Err(err) => warn!(error = %err, "mDNS failed to start"),
+                Err(err) => {
+                    warn!(error = %err, "mDNS failed to start");
+                    self.dashboard_state
+                        .push_log(format!("mDNS failed to start: {err}"));
+                }
             }
+        } else {
+            self.dashboard_state
+                .push_log("mDNS disabled (--no-discovery)");
         }
 
         let _ = self.running_tx.send(true);
@@ -174,6 +188,9 @@ impl App {
 
         let cast = CastTlsServer::new(CastServerConfig {
             bind_addr: self.cli.cast_addr,
+            lan_ip,
+            mdns_hostname: "omnicast.local".into(),
+            receiver_name: name.clone(),
         });
         let cast_tx = self.event_tx.clone();
         let cast_rx = self.running_rx.clone();
@@ -190,6 +207,11 @@ impl App {
             self.cli.cast_addr.port(),
             self.cli.rtsp_addr.port()
         );
+        self.dashboard_state.push_log(format!(
+            "Listeners active — Cast TLS :{} · RTSP :{}",
+            self.cli.cast_addr.port(),
+            self.cli.rtsp_addr.port()
+        ));
         info!("listeners started");
     }
 
@@ -200,19 +222,44 @@ impl App {
         }
         self.listeners_started = false;
         self.dashboard_state.listening = false;
-        self.dashboard_state.status_line = "Stopped — press Start to advertise on the LAN".into();
+        self.dashboard_state.status_line =
+            "Stopped — press Start Listening to advertise on the LAN".into();
+        self.dashboard_state
+            .push_log("Listeners stopped — mDNS and sockets closed");
         info!("listeners stopped");
     }
 
     fn apply_rename(&mut self, name: String) {
         self.dashboard_state.receiver_name = name.clone();
+        self.dashboard_state.settings_name = name.clone();
         if let Some(disco) = self.discovery.as_mut() {
             if let Err(err) = disco.set_instance_name(&name) {
                 warn!(error = %err, "failed to update mDNS name");
+                self.dashboard_state
+                    .push_log(format!("Failed to re-advertise as \"{name}\": {err}"));
             } else {
                 self.dashboard_state.status_line = format!("mDNS name updated to '{name}'");
+                self.dashboard_state
+                    .push_log(format!("mDNS re-advertised as \"{name}\""));
             }
+        } else {
+            self.dashboard_state
+                .push_log(format!("Receiver name set to \"{name}\" (start listening to advertise)"));
         }
+    }
+
+    fn apply_viewer_settings(&mut self) {
+        self.settings = self.dashboard_state.viewer.clone();
+        let on_top = self.settings.always_on_top;
+        for ctx in self.devices.values() {
+            ctx.surface.window.set_window_level(if on_top {
+                winit::window::WindowLevel::AlwaysOnTop
+            } else {
+                winit::window::WindowLevel::Normal
+            });
+        }
+        self.dashboard_state
+            .push_log("Viewer HUD preferences updated");
     }
 
     fn refresh_dashboard_devices(&mut self) {
@@ -222,6 +269,16 @@ impl App {
             .values()
             .map(|c| {
                 let snap = c.metrics.snapshot();
+                let feed_open = open.contains_key(&c.session.id);
+                let video_status = if feed_open {
+                    if snap.fps > 0.5 {
+                        format!("Video live ({:.0} FPS)", snap.fps)
+                    } else {
+                        "Feed open".into()
+                    }
+                } else {
+                    "Idle".into()
+                };
                 DashboardDevice {
                     id: c.session.id,
                     peer_ip: if c.session.peer_ip.is_empty() {
@@ -229,10 +286,12 @@ impl App {
                     } else {
                         c.session.peer_ip.clone()
                     },
+                    device_name: c.session.device_name.clone(),
                     codec: c.session.codec.clone(),
                     protocol: c.session.protocol.clone(),
                     uptime_label: snap.uptime_label(),
-                    feed_open: open.contains_key(&c.session.id),
+                    video_status,
+                    feed_open,
                 }
             })
             .collect();
@@ -243,6 +302,15 @@ impl App {
             match event {
                 AppEvent::DeviceConnected(session) => {
                     info!(device = %session.device_name, id = %session.id, ip = %session.peer_ip, "device connected");
+                    let peer = if session.peer_ip.is_empty() {
+                        session.device_name.clone()
+                    } else {
+                        session.peer_ip.clone()
+                    };
+                    self.dashboard_state.push_log(format!(
+                        "Device connected: {peer} ({})",
+                        session.protocol
+                    ));
                     let metrics = StreamMetrics::new();
                     self.metrics_registry.register(session.id, metrics.clone());
                     self.connected.insert(
@@ -260,6 +328,8 @@ impl App {
                 }
                 AppEvent::DeviceDisconnected { id, reason } => {
                     info!(%id, %reason, "device disconnected");
+                    self.dashboard_state
+                        .push_log(format!("Device disconnected: {reason}"));
                     self.metrics_registry.unregister(id);
                     self.connected.remove(&id);
                     if let Some(window_id) = self.device_windows.remove(&id) {
@@ -283,7 +353,8 @@ impl App {
                 }
                 AppEvent::Status(msg) => {
                     info!(%msg, "status");
-                    self.dashboard_state.status_line = msg;
+                    self.dashboard_state.status_line = msg.clone();
+                    self.dashboard_state.push_log(msg);
                 }
             }
         }
@@ -325,7 +396,12 @@ impl App {
             .with_position(LogicalPosition::new(
                 120.0 + f64::from(index) * 40.0,
                 80.0 + f64::from(index) * 40.0,
-            ));
+            ))
+            .with_window_level(if self.settings.always_on_top {
+                winit::window::WindowLevel::AlwaysOnTop
+            } else {
+                winit::window::WindowLevel::Normal
+            });
         let window = Arc::new(event_loop.create_window(attrs).context("create_window")?);
         let window_id = window.id();
         let surface =
@@ -375,8 +451,9 @@ impl App {
         drop(bootstrap);
 
         let attrs = Window::default_attributes()
-            .with_title("OmniCast Receiver")
-            .with_inner_size(LogicalSize::new(520.0, 560.0))
+            .with_title("OmniCast")
+            .with_inner_size(LogicalSize::new(720.0, 820.0))
+            .with_min_inner_size(LogicalSize::new(560.0, 640.0))
             .with_position(LogicalPosition::new(64.0, 48.0));
         let window = Arc::new(
             event_loop
@@ -428,6 +505,7 @@ impl App {
                     error!(error = %err, "open feed failed");
                 }
             }
+            DashboardAction::ViewerSettingsChanged => self.apply_viewer_settings(),
         }
     }
 
@@ -554,9 +632,23 @@ impl ApplicationHandler<AppEvent> for App {
                 ctx.metrics.record_frame();
                 let snap = ctx.metrics.snapshot();
                 let name = ctx.session.device_name.clone();
+                // Keep feed HUD prefs in sync with dashboard settings.
+                ctx.surface.overlay.settings = self.settings.clone();
                 let action = ctx.surface.render(gpu, &snap, &name);
                 self.frames_drawn += 1;
+                // Allow in-feed settings edits to flow back.
                 self.settings = ctx.surface.overlay.settings.clone();
+                self.dashboard_state.viewer = self.settings.clone();
+                if self.settings.show_fps {
+                    ctx.surface.window.set_title(&format!(
+                        "{} — {:.0} FPS — OmniCast",
+                        name, snap.fps
+                    ));
+                } else {
+                    ctx.surface
+                        .window
+                        .set_title(&format!("{name} — OmniCast"));
+                }
                 if action == HudAction::OpenSettings {
                     info!("settings panel opened");
                 }

@@ -190,17 +190,19 @@ impl DiscoveryService {
     }
 }
 
-/// Android Cast Quick Settings scanners expect these TXT keys to show a friendly name.
+/// Android Cast Quick Settings scanners expect these Chromecast-style TXT keys.
 fn cast_properties(config: &DiscoveryConfig, device_id: &str) -> HashMap<String, String> {
+    // `id` must be a 32-char hex UUID without dashes (Uuid::simple()).
+    debug_assert_eq!(device_id.len(), 32);
     let mut props = HashMap::new();
+    props.insert("id".into(), device_id.to_string());
     props.insert("fn".into(), config.instance_name.clone());
     props.insert("md".into(), "Chromecast".into());
-    props.insert("id".into(), device_id.to_string());
-    props.insert("rm".into(), String::new());
     props.insert("ve".into(), "02".into());
     props.insert("st".into(), "0".into());
     props.insert("ca".into(), "4101".into());
     props.insert("ic".into(), "/setup/icon.png".into());
+    props.insert("rm".into(), String::new());
     props.insert("bs".into(), "000000000000".into());
     props.insert("rs".into(), String::new());
     props
