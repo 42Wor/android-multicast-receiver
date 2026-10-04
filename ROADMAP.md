@@ -1,63 +1,111 @@
 # OmniCast Roadmap
 
-Semantic versioning starts at **`v0.1.0-alpha`**. Milestones below track the path from a single-device GPU shell to a multi-device production receiver.
+Semantic versioning starts at **`v0.1.0-alpha`** (git tag present).
+
+## Current status (summary)
+
+| Area | State |
+|------|--------|
+| Phase 1 — workspace / crates / window+render shell | **Complete** |
+| Milestone 1 — mDNS + live RTSP handshake + mock video path | **Complete** |
+| Telemetry HUD + settings panel | **Complete** (landed; UX polish welcome) |
+| HW H.264 decode → live pixels | **Next** |
+| Multi-device production sessions | **Planned** |
+| Miracast / Cast V2 interoperability | **Planned** |
+
+---
 
 ## Phase 1 — Repository & architecture *(complete)*
 
-- [x] Cargo workspace with clear crate boundaries
-- [x] Community docs (`README`, `ROADMAP`, `CONTRIBUTING`, MIT license)
-- [x] Core session / messaging types
-- [x] Render + app scaffolding
+- [x] Cargo workspace (`resolver = "2"`) with clear crate boundaries
+- [x] Crates: `omnicast-core`, `discovery`, `protocol`, `media`, `render`, `ui`, `app`
+- [x] Community docs (`README`, `ROADMAP`, `CONTRIBUTING`, MIT `LICENSE`)
+- [x] Core session / device IDs / `AppEvent` messaging types
+- [x] Initial `winit` multi-window shell + `wgpu` fullscreen blit
+- [x] Protocol foundations: RTSP listener scaffold + RTP / H.264 NAL parser
+- [x] mDNS discovery surface (`_rtsp._tcp`, `_display._tcp`, `_googlecast._tcp`)
+
+---
 
 ## Phase 2 — Milestone 1: Single-device MVP — `v0.1.0-alpha`
 
-**Goal:** Prove the end-to-end desktop pipeline with one phone-shaped session.
+**Goal:** One phone-shaped session from discovery → handshake → presented frames (mock or real).
 
 ### Mobile 1 — Live discovery + RTSP handshake *(complete)*
 
-- [x] mDNS advertisement so LAN phones can see **OmniCast**
-- [x] Live TCP/RTSP handshake listener (`omnicast-protocol`)
-- [x] Terminal logging of incoming packets and session parameters
-- [x] Multi-window map + `wgpu` blit + mock 60 FPS path
-- [ ] Real Android device completes RTSP → first **decoded** video frame (next media milestone)
+- [x] mDNS advertisement so LAN devices can see **OmniCast**
+- [x] Live TCP/RTSP handshake (`OPTIONS` / `DESCRIBE` / `ANNOUNCE` / `SETUP` / `PLAY` / `TEARDOWN`)
+- [x] Terminal logging of packets and session parameters (IP, ports, codec)
+- [x] Multi-window map (`WindowId` → `DeviceContext`) + mock ~60 FPS path
+- [ ] Real Android device completes RTSP → first **hardware-decoded** video frame
 
-### Stream telemetry overlay & settings *(complete)*
+### Stream telemetry overlay & settings *(complete — recently landed)*
 
-- [x] Thread-safe `StreamMetrics` (FPS, bitrate, uptime, frames/drops) in `omnicast-core`
+Shipped in-tree; treat remaining work as polish, not blockers:
+
+- [x] Thread-safe `StreamMetrics` (FPS, bitrate, uptime, frames/drops)
 - [x] `MetricsRegistry` for protocol → UI updates
 - [x] `egui` + `egui-wgpu` translucent HUD over the video surface
-- [x] Live FPS / bitrate / uptime (and packet stats) on the device window
-- [x] Settings panel: display toggles, always-on-top, aspect lock, listen port, buffer slider, borderless
-- [x] HUD pin / auto-hide (shortcut **H**; **S** opens settings)
+- [x] Live FPS / bitrate / uptime (+ packet stats) on the device window
+- [x] Settings modal: display toggles, always-on-top, aspect lock, listen port, buffer slider, borderless
+- [x] HUD pin / auto-hide (**H** pin; **S** / ⚙ opens settings)
+- [ ] Optional polish: persist settings to disk, aspect-ratio enforcement on resize
 
 ```bash
 cargo run -p omnicast-app -- --demo
-# Hover the top of the window for the HUD, or press H to pin / S for settings
+# Hover top edge for HUD · H pin · S settings
 ```
+
+---
 
 ## Phase 3 — Milestone 2: Real media path — `v0.2.0`
 
 - [ ] Production H.264 decode backend (platform HW where available)
-- [ ] NV12 / YUV → RGB GPU conversion path hardened
-- [ ] Stable RTSP SETUP/PLAY against at least one OEM mirror stack or Cast sink profile
+- [ ] NV12 / YUV → RGB (or GPU convert) path hardened
+- [ ] Stable SETUP/PLAY against at least one OEM mirror stack **or** Cast sink profile
 - [ ] Session teardown / reconnect without leaking GPU resources
-- [x] Basic metrics: FPS, bitrate, drop counters in UI overlay
+- [x] Basic metrics overlay (FPS, bitrate, drops) — done early in v0.1.0-alpha
 
-## Phase 4 — Milestone 3: Multi-device beta — `v0.3.0`
+---
 
-- [ ] Concurrent sessions, each with isolated window + surface + decoder
+## Phase 4 — Milestone 3: Multi-device sessions — `v0.3.0`
+
+**Goal:** Several phones cast concurrently with isolated windows and media pipelines.
+
+- [ ] Concurrent sessions: one window + surface + decoder + metrics per device
 - [ ] Backpressure between RTP ingest and GPU upload
+- [ ] Fair scheduling when N streams compete for decode/GPU
 - [ ] Discovery conflict handling and receiver rename
-- [ ] Linux CI + Windows CI smoke (`cargo check`, demo headless where possible)
-- [ ] Packaging sketch (MSI / portable zip)
+- [ ] Stress demo: `cargo run -p omnicast-app -- --demo --devices N`
+- [ ] Linux + Windows CI smoke (`cargo check` / tests)
+- [ ] Packaging sketch (portable zip / MSI)
 
-## Phase 5 — Milestone 4: Multi-device production — `v1.0.0`
+---
 
-- [ ] Broad OEM validation matrix (Pixel, Samsung Smart View, etc.)
-- [ ] Documented protocol capability matrix (Cast vs Miracast/WFD)
+## Phase 5 — Protocol depth: Miracast & Cast V2 — `v0.4.0` → `v1.0.0`
+
+### Google Cast V2 *(planned)*
+
+- [ ] Cast TLS control channel (typical port **8009**) beyond mDNS TXT advertisement
+- [ ] Receiver app / screen-mirroring session negotiation compatible with stock Cast UI
+- [ ] Capability / status TXT records kept accurate (`fn`, `md`, `id`, `ca`, `st`, …)
+- [ ] Document which Android “Cast” paths hit Cast V2 vs RTSP-only clients
+
+### Miracast / Wi-Fi Display *(planned)*
+
+- [ ] Research Windows WFD sink feasibility vs pure userspace RTSP
+- [ ] Adapter interface under `omnicast-protocol` (no UI coupling)
+- [ ] OEM matrix notes (Samsung Smart View, etc.)
+- [ ] Honest capability matrix in docs (what works / what needs OS support)
+
+### Production hardening — `v1.0.0`
+
+- [ ] Broad device validation matrix
 - [ ] Secure defaults, firewall guidance, signed releases
-- [ ] Optional reverse-input explicitly out-of-scope unless separately specified
-- [ ] Stable crate APIs and contributor onboarding complete
+- [ ] Stable crate APIs and contributor onboarding
+- [ ] Reverse input remains **out of scope** unless separately specified
+
+---
 
 ## Non-goals (near term)
 
@@ -67,6 +115,6 @@ cargo run -p omnicast-app -- --demo
 
 ## Notes for Android testing
 
-- Allow **UDP 5353** (mDNS) and **TCP 8554** (RTSP) / **UDP 5004** (RTP) through Windows Firewall.
-- Native **Google Cast** UI may still require Cast TLS (port 8009) beyond mDNS — RTSP clients and some OEM mirror stacks will hit the handshake logged here.
-- Prefer the same Wi‑Fi LAN (not guest/AP isolation).
+- Allow **UDP 5353** (mDNS), **TCP 8554** (RTSP), **UDP 5004** (RTP) through Windows Firewall.
+- Stock Google Cast UI may require Cast V2 TLS — RTSP clients hit the handshake logged today.
+- Prefer the same Wi‑Fi LAN (not guest / AP isolation).

@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "OmniCast desktop receiver binary — winit event loop and device windows"
-default-run = "omnicast"
+default-run = "omnicast-app"
 
 [[bin]]
-name = "omnicast"
+name = "omnicast-app"
 path = "src/main.rs"
 
 [dependencies]

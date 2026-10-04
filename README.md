@@ -2,13 +2,27 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.1.0--alpha-blue.svg)](ROADMAP.md)
+[![Version](https://img.shields.io/badge/version-v0.1.0--alpha-blue.svg)](ROADMAP.md)
+[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#current-status)
 
-**omnicast-rs** is a high-performance, open-source Android screen-casting **desktop receiver** written in Rust. It advertises itself on the local network, accepts streaming sessions, decodes H.264, and renders each phone into its own native, resizable GPU-backed window.
+**omnicast-rs** is a high-performance, open-source Android screen-casting **desktop receiver** written in Rust. It advertises itself on the local network, accepts streaming sessions, and renders each phone into its own native, resizable GPU-backed window.
 
-> Milestone 1 (`v0.1.0-alpha`): end-to-end single-device pipeline shell with multi-window `winit` + `wgpu` rendering and a 60 FPS synthetic frame demo.
+## Current Status
 
-## Architecture
+| | |
+|---|---|
+| **Version** | `v0.1.0-alpha` (git tag) |
+| **Phase** | Milestone 1 shell + live RTSP handshake + telemetry HUD |
+| **Platforms** | Windows-first (Linux / macOS architecture-ready) |
+| **Cast path** | mDNS + RTSP/RTP foundations; full Cast V2 / Miracast planned |
+
+**Done today:** workspace crates, `winit`/`wgpu` multi-window render, mDNS as **OmniCast**, live RTSP handshake with packet logging, mock 60 FPS demo, `egui` HUD (FPS / bitrate / uptime) and settings modal.
+
+**Next up:** hardware H.264 decode, multi-device session isolation, Miracast / Cast V2 adapters — see [ROADMAP.md](ROADMAP.md).
+
+---
+
+## Crate architecture
 
 ```mermaid
 flowchart LR
@@ -18,57 +32,97 @@ flowchart LR
   Media -->|RGBA / NV12 frames| App[omnicast-app]
   Disco --> App
   App -->|WindowId map| Render[omnicast-render]
-  Render -->|wgpu Surface| Win[Native window]
+  UI[omnicast-ui] --> Render
+  Render -->|wgpu + egui HUD| Win[Native window]
   Core[omnicast-core] -.-> App
   Core -.-> Proto
   Core -.-> Media
+  Core -.-> UI
 ```
 
 | Crate | Role |
 |-------|------|
-| `omnicast-core` | Session state, device IDs, cross-crate message types |
-| `omnicast-discovery` | mDNS advertisement (`_display._tcp` / `_googlecast._tcp`) |
-| `omnicast-protocol` | Async RTSP server + RTP / H.264 NAL extraction |
-| `omnicast-media` | Decode pipeline (H.264 → raw frames; mock path in alpha) |
-| `omnicast-render` | `wgpu` shaders, textures, fullscreen blit |
-| `omnicast-app` | `winit` `ApplicationHandler`, `WindowId` → `DeviceContext` |
+| `omnicast-app` | Binary (`omnicast-app` / `omnicast`): `winit` `ApplicationHandler`, session → window map |
+| `omnicast-core` | `DeviceId`, sessions, `AppEvent`, thread-safe `StreamMetrics` / `MetricsRegistry` |
+| `omnicast-discovery` | mDNS / DNS-SD advertisement (`_rtsp._tcp`, `_display._tcp`, `_googlecast._tcp`) |
+| `omnicast-protocol` | Tokio RTSP server, RTP parse, H.264 NAL extraction, session logging |
+| `omnicast-media` | Decode pipeline stub + mock RGBA frame generator |
+| `omnicast-render` | `wgpu` blit pipeline + `egui-wgpu` overlay host |
+| `omnicast-ui` | HUD telemetry bar + settings panel (immediate-mode `egui`) |
 
-## Features (alpha)
+```
+crates/
+  omnicast-app/          # binary entry
+  omnicast-core/         # shared types + metrics
+  omnicast-discovery/    # mDNS
+  omnicast-protocol/     # RTSP / RTP
+  omnicast-media/        # decode / mock frames
+  omnicast-render/       # wgpu + egui overlay
+  omnicast-ui/           # HUD + settings widgets
+```
 
-- Native multi-window receiver shell (`winit` ApplicationHandler)
-- Hardware-accelerated presentation via `wgpu`
-- Live telemetry HUD (FPS, bitrate, uptime) via `egui` / `egui-wgpu`
-- In-window settings panel (display, network buffer, borderless / always-on-top)
-- mDNS receiver advertisement on LAN
-- Tokio-based RTSP listener and RTP H.264 NAL parser
-- Synthetic 60 FPS frame generator for pipeline verification
-- View-only (no reverse input) for v0.1
+---
 
-## Quick start
+## UI features (telemetry & settings)
+
+Landed in `v0.1.0-alpha`:
+
+| Feature | Details |
+|---------|---------|
+| **HUD telemetry bar** | Translucent top bar over the video surface (`egui` / `egui-wgpu`) |
+| **Live FPS** | Rolling 1-second window via `StreamMetrics` |
+| **Bitrate** | Incoming throughput (Kbps / Mbps) from network samples |
+| **Uptime** | `HH:MM:SS` since session connect |
+| **Packet stats** | Frame count and drop counter |
+| **Settings modal** | Display toggles, always-on-top, aspect lock, listen port, buffer slider, borderless window |
+| **HUD behaviour** | Auto-hide when idle, or pin with **H**; open settings with **S** or **⚙ Settings** |
+
+```bash
+cargo run --bin omnicast-app -- --demo
+# Hover the top edge · press H to pin · press S for settings
+```
+
+---
+
+## Build & run
 
 ### Prerequisites
 
 - Rust **1.75+** (stable)
-- Windows 10/11 (primary MVP target), GPU drivers for `wgpu`
-- Same Wi-Fi LAN as the Android device (for real discovery later)
+- Windows 10/11 (primary MVP target) with GPU drivers for `wgpu`
+- Same Wi‑Fi LAN as the Android device for live casting tests
 
-### Build & run (live phone — Milestone 1 / Mobile 1)
+### Install / build
 
 ```bash
+git clone <your-fork-or-local-path>
+cd android-multicast-receiver   # or omnicast-rs
+
 cargo build -p omnicast-app
+```
+
+### Run (recommended)
+
+Package-qualified (always works from the workspace root):
+
+```bash
 cargo run -p omnicast-app
 ```
 
-This advertises **OmniCast** via mDNS (`_rtsp._tcp`, `_display._tcp`, `_googlecast._tcp`) and accepts RTSP on TCP **8554**. When your phone connects, the terminal logs every request/response plus session parameters (peer IP/port, Transport, codec).
-
-Allow **UDP 5353**, **TCP 8554**, and **UDP 5004** through Windows Firewall. Stay on the same Wi‑Fi LAN (not guest/AP isolation).
-
-### Demo (synthetic frames)
+Binary name (after build / as documented):
 
 ```bash
-cargo run -p omnicast-app -- --demo
-cargo run -p omnicast-app -- --demo --devices 2
-cargo run -p omnicast-app -- --no-discovery
+cargo run --bin omnicast-app
+```
+
+**Live phone mode** advertises **OmniCast** on the LAN and listens for RTSP on TCP **8554**. Allow **UDP 5353**, **TCP 8554**, and **UDP 5004** in Windows Firewall.
+
+### Demo (synthetic multi-window)
+
+```bash
+cargo run --bin omnicast-app -- --demo
+cargo run --bin omnicast-app -- --demo --devices 2
+cargo run --bin omnicast-app -- --no-discovery
 ```
 
 ### Checks
@@ -77,32 +131,26 @@ cargo run -p omnicast-app -- --no-discovery
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 cargo check --workspace
+cargo test --workspace
 ```
+
+---
 
 ## Protocol notes
 
 | Stack | Status in v0.1.0-alpha |
 |-------|------------------------|
-| mDNS display / Cast / RTSP service records as **OmniCast** | Actively advertised |
-| Live RTSP handshake + packet/session logging | Implemented (Mobile 1) |
+| mDNS as **OmniCast** (RTSP / display / Cast-oriented records) | Actively advertised |
+| Live RTSP handshake + packet/session logging | Implemented |
 | RTP depacketization (H.264 NAL extract) | Implemented |
-| Full Google Cast / Miracast OEM interoperability | Not yet — see [ROADMAP.md](ROADMAP.md) |
-| Production HW decoder backends | Stub / mock frames; real decode tracked for Phase 2 |
+| Telemetry HUD + settings | Implemented |
+| Full Google Cast V2 / Miracast OEM interoperability | Planned — [ROADMAP.md](ROADMAP.md) |
+| Production HW decoder backends | Stub / mock frames |
 
-Advertising Cast-oriented DNS-SD records does **not** by itself complete a phone cast session. Control-plane and media negotiation continue in later milestones.
+Advertising Cast-oriented DNS-SD records does **not** by itself complete a stock Cast session. Cast V2 TLS and Miracast/WFD adapters are tracked milestones.
 
-## Project layout
-
-```
-crates/
-  omnicast-core/
-  omnicast-discovery/
-  omnicast-protocol/
-  omnicast-media/
-  omnicast-render/
-  omnicast-app/
-```
+---
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — contributions welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
