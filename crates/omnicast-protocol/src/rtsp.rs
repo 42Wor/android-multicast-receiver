@@ -1,7 +1,7 @@
 //! Live async RTSP control server for a single-device Milestone 1 handshake.
 
 use crate::rtp::{parse_rtp_packet, H264Depacketizer};
-use omnicast_core::{AppEvent, DeviceId, SessionInfo, SessionState};
+use omnicast_core::{AppEvent, DeviceId, MetricsRegistry, SessionInfo, SessionState};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use thiserror::Error;
@@ -51,11 +51,20 @@ pub struct SessionParams {
 /// Accepts RTSP TCP sessions and demuxes RTP on UDP into NAL callbacks via AppEvent.
 pub struct RtspServer {
     config: RtspServerConfig,
+    metrics: MetricsRegistry,
 }
 
 impl RtspServer {
     pub fn new(config: RtspServerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            metrics: MetricsRegistry::new(),
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: MetricsRegistry) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     pub async fn run(self, events: mpsc::Sender<AppEvent>) -> Result<(), RtspError> {
@@ -80,8 +89,9 @@ impl RtspServer {
 
         let rtp_events = events.clone();
         let rtp_sock_task = Arc::clone(&rtp_sock);
+        let rtp_metrics = self.metrics.clone();
         tokio::spawn(async move {
-            if let Err(err) = rtp_loop(rtp_sock_task, rtp_events).await {
+            if let Err(err) = rtp_loop(rtp_sock_task, rtp_events, rtp_metrics).await {
                 warn!(error = %err, "RTP loop exited");
             }
         });
@@ -102,10 +112,13 @@ impl RtspServer {
                 .await;
 
             let events = events.clone();
+            let metrics = self.metrics.clone();
             let rtp_port = self.config.rtp_port;
             let server_ip = server_ip.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_client(socket, peer, rtp_port, server_ip, events).await {
+                if let Err(err) =
+                    handle_client(socket, peer, rtp_port, server_ip, events, metrics).await
+                {
                     warn!(%peer, error = %err, "RTSP session ended with error");
                 }
             });
@@ -113,7 +126,11 @@ impl RtspServer {
     }
 }
 
-async fn rtp_loop(sock: Arc<UdpSocket>, events: mpsc::Sender<AppEvent>) -> Result<(), RtspError> {
+async fn rtp_loop(
+    sock: Arc<UdpSocket>,
+    events: mpsc::Sender<AppEvent>,
+    metrics: MetricsRegistry,
+) -> Result<(), RtspError> {
     let mut buf = vec![0u8; 2048];
     let mut depacketizer = H264Depacketizer::new();
     let placeholder = DeviceId::new();
@@ -123,6 +140,7 @@ async fn rtp_loop(sock: Arc<UdpSocket>, events: mpsc::Sender<AppEvent>) -> Resul
         let (n, from) = sock.recv_from(&mut buf).await?;
         packet_count += 1;
         log_raw_packet("RTP/UDP", from, &buf[..n]);
+        metrics.record_network_active(n as u64, 1);
 
         match parse_rtp_packet(&buf[..n]) {
             Ok(packet) => {
@@ -161,10 +179,16 @@ async fn rtp_loop(sock: Arc<UdpSocket>, events: mpsc::Sender<AppEvent>) -> Resul
                             let _ = placeholder;
                         }
                     }
-                    Err(err) => warn!(error = %err, "H.264 depacketize error"),
+                    Err(err) => {
+                        metrics.record_drop_active(1);
+                        warn!(error = %err, "H.264 depacketize error");
+                    }
                 }
             }
-            Err(err) => warn!(error = %err, from = %from, "RTP parse error"),
+            Err(err) => {
+                metrics.record_drop_active(1);
+                warn!(error = %err, from = %from, "RTP parse error");
+            }
         }
     }
 }
@@ -175,6 +199,7 @@ async fn handle_client(
     rtp_port: u16,
     server_ip: String,
     events: mpsc::Sender<AppEvent>,
+    metrics: MetricsRegistry,
 ) -> Result<(), RtspError> {
     let mut params = SessionParams {
         peer_ip: peer.ip().to_string(),
@@ -263,6 +288,7 @@ async fn handle_client(
             if msg.method == "PLAY" && !connected_emitted {
                 session.state = SessionState::Active;
                 session.device_name = format!("Phone {}", params.peer_ip);
+                metrics.set_active(device_id);
                 let _ = events
                     .send(AppEvent::DeviceConnected(session.clone()))
                     .await;
