@@ -50,18 +50,21 @@ flowchart LR
 - Windows 10/11 (primary MVP target), GPU drivers for `wgpu`
 - Same Wi-Fi LAN as the Android device (for real discovery later)
 
-### Build & run demo
+### Build & run (live phone — Milestone 1 / Mobile 1)
 
 ```bash
 cargo build -p omnicast-app
-cargo run -p omnicast-app -- --demo
+cargo run -p omnicast-app
 ```
 
-`--demo` opens a mock device session and renders animated frames at ~60 FPS into a resizable window.
+This advertises **OmniCast** via mDNS (`_rtsp._tcp`, `_display._tcp`, `_googlecast._tcp`) and accepts RTSP on TCP **8554**. When your phone connects, the terminal logs every request/response plus session parameters (peer IP/port, Transport, codec).
 
-Optional flags:
+Allow **UDP 5353**, **TCP 8554**, and **UDP 5004** through Windows Firewall. Stay on the same Wi‑Fi LAN (not guest/AP isolation).
+
+### Demo (synthetic frames)
 
 ```bash
+cargo run -p omnicast-app -- --demo
 cargo run -p omnicast-app -- --demo --devices 2
 cargo run -p omnicast-app -- --no-discovery
 ```
@@ -78,8 +81,9 @@ cargo check --workspace
 
 | Stack | Status in v0.1.0-alpha |
 |-------|------------------------|
-| mDNS display / Cast-oriented service records | Advertised |
-| RTSP session scaffolding + RTP depacketization | Implemented (listener + parser) |
+| mDNS display / Cast / RTSP service records as **OmniCast** | Actively advertised |
+| Live RTSP handshake + packet/session logging | Implemented (Mobile 1) |
+| RTP depacketization (H.264 NAL extract) | Implemented |
 | Full Google Cast / Miracast OEM interoperability | Not yet — see [ROADMAP.md](ROADMAP.md) |
 | Production HW decoder backends | Stub / mock frames; real decode tracked for Phase 2 |
 

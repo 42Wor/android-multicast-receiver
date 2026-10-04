@@ -13,14 +13,28 @@ Semantic versioning starts at **`v0.1.0-alpha`**. Milestones below track the pat
 
 **Goal:** Prove the end-to-end desktop pipeline with one phone-shaped session.
 
-- [x] mDNS advertisement (`_display._tcp` / `_googlecast._tcp`)
-- [x] Tokio RTSP listener + RTP H.264 NAL extraction
+### Mobile 1 — Live discovery + RTSP handshake *(current)*
+
+- [x] mDNS advertisement so LAN phones can see **OmniCast**
+  - `_rtsp._tcp`, `_display._tcp`, `_googlecast._tcp`
+  - Cast-style TXT (`fn`, `md`, `id`, …) + explicit LAN IPv4 when available
+- [x] Live TCP/RTSP handshake listener (`omnicast-protocol`)
+  - OPTIONS / DESCRIBE / ANNOUNCE / SETUP / PLAY / TEARDOWN
+  - UDP RTP + interleaved TCP RTP logging
+- [x] Terminal logging of incoming packets and session parameters
+  - Peer IP/port, Transport, client/server RTP ports, video codec / payload type
 - [x] `winit` `ApplicationHandler` multi-window map (`WindowId` → `DeviceContext`)
 - [x] `wgpu` fullscreen texture blit (WGSL)
 - [x] Synthetic/mock 60 FPS frame path for verification
-- [ ] Real Android device completes RTSP → first decoded frame (Phase 2+)
+- [ ] Real Android device completes RTSP → first **decoded** video frame (Milestone 2)
 
-**Exit criteria:** `cargo run -p omnicast-app -- --demo` sustains a resizable window at ~60 FPS.
+**Exit criteria (Mobile 1):** Run without `--demo`, phone sees **OmniCast**, tap connects, terminal shows RTSP handshake + session params.
+
+```bash
+cargo run -p omnicast-app
+# On Android: Cast / Screen Mirroring / Smart View → select OmniCast
+# Watch terminal for RTSP request/response and RTP lines
+```
 
 ## Phase 3 — Milestone 2: Real media path — `v0.2.0`
 
@@ -51,3 +65,9 @@ Semantic versioning starts at **`v0.1.0-alpha`**. Milestones below track the pat
 - Companion APK requirement on the phone
 - Cloud relay / WAN casting
 - DRM circumvention or HDCP bypass tooling
+
+## Notes for Android testing
+
+- Allow **UDP 5353** (mDNS) and **TCP 8554** (RTSP) / **UDP 5004** (RTP) through Windows Firewall.
+- Native **Google Cast** UI may still require Cast TLS (port 8009) beyond mDNS — RTSP clients and some OEM mirror stacks will hit the handshake logged here.
+- Prefer the same Wi‑Fi LAN (not guest/AP isolation).

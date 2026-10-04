@@ -35,8 +35,8 @@ struct Cli {
     #[arg(long)]
     no_discovery: bool,
 
-    /// Friendly receiver name for mDNS
-    #[arg(long, default_value = "OmniCast Receiver")]
+    /// Friendly receiver name for mDNS (shown on phones)
+    #[arg(long, default_value = "OmniCast")]
     receiver_name: String,
 
     /// RTSP listen address
@@ -79,12 +79,20 @@ impl App {
         } else {
             match DiscoveryService::start(DiscoveryConfig {
                 instance_name: cli.receiver_name.clone(),
-                host_name: "omnicast-receiver".into(),
+                host_name: "omnicast".into(),
                 port: cli.rtsp_addr.port(),
                 advertise_display: true,
                 advertise_googlecast: true,
+                advertise_rtsp: true,
             }) {
-                Ok(svc) => Some(svc),
+                Ok(svc) => {
+                    info!(
+                        active = svc.is_active(),
+                        name = %cli.receiver_name,
+                        "mDNS advertising — look for this name on your Android cast/mirror list"
+                    );
+                    Some(svc)
+                }
                 Err(err) => {
                     warn!(error = %err, "mDNS discovery failed to start; continuing");
                     None
