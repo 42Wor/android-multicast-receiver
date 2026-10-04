@@ -1,0 +1,1 @@
+Never include any "Co-authored-by" trailer or attribution to Cursor in any git commit messages. All commits must be authored strictly and solely by the user.
